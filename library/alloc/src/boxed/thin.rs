@@ -430,3 +430,75 @@ impl<T: ?Sized + Error> Error for ThinBox<T> {
         self.deref().source()
     }
 }
+
+#[cfg(kani)]
+#[unstable(feature = "kani", issue = "none")]
+mod verify {
+    use super::*;
+
+    // Exercises: WithHeader::new, header, ThinBox::with_header, meta, Deref::deref, Drop::drop
+    #[kani::proof]
+    fn check_thinbox_new_deref_u32() {
+        let val: u32 = kani::any();
+        let tb = ThinBox::new(val);
+        assert_eq!(*tb, val);
+    }
+
+    // Exercises: WithHeader::try_new
+    #[kani::proof]
+    fn check_thinbox_try_new_u32() {
+        let val: u32 = kani::any();
+        if let Ok(tb) = ThinBox::try_new(val) {
+            assert_eq!(*tb, val);
+        }
+    }
+
+    // Exercises: DerefMut::deref_mut
+    #[kani::proof]
+    fn check_thinbox_deref_mut_u32() {
+        let val: u32 = kani::any();
+        let new_val: u32 = kani::any();
+        let mut tb = ThinBox::new(val);
+        *tb = new_val;
+        assert_eq!(*tb, new_val);
+    }
+
+    // Exercises: explicit Drop::drop
+    #[kani::proof]
+    fn check_thinbox_drop_u32() {
+        let val: u32 = kani::any();
+        let tb = ThinBox::new(val);
+        drop(tb);
+    }
+
+    // Exercises: ZST path (dangling pointer, no alloc/dealloc)
+    #[kani::proof]
+    fn check_thinbox_new_zst() {
+        let tb = ThinBox::new(());
+        let _ = *tb;
+    }
+
+    // Exercises: ZST try_new path
+    #[kani::proof]
+    fn check_thinbox_try_new_zst() {
+        if let Ok(tb) = ThinBox::try_new(()) {
+            let _ = *tb;
+        }
+    }
+
+    // Exercises: u8 type (different alignment than u32)
+    #[kani::proof]
+    fn check_thinbox_new_deref_u8() {
+        let val: u8 = kani::any();
+        let tb = ThinBox::new(val);
+        assert_eq!(*tb, val);
+    }
+
+    // Exercises: i64 type (larger type)
+    #[kani::proof]
+    fn check_thinbox_new_deref_i64() {
+        let val: i64 = kani::any();
+        let tb = ThinBox::new(val);
+        assert_eq!(*tb, val);
+    }
+}
