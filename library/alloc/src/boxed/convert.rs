@@ -4,6 +4,7 @@ use core::mem;
 use core::pin::Pin;
 #[cfg(not(no_global_oom_handling))]
 use core::{fmt, ptr};
+use safety::requires;
 
 use crate::alloc::Allocator;
 #[cfg(not(no_global_oom_handling))]
@@ -391,6 +392,7 @@ impl<A: Allocator> Box<dyn Any, A> {
     /// [`downcast`]: Self::downcast
     #[inline]
     #[unstable(feature = "downcast_unchecked", issue = "90850")]
+    #[requires(self.is::<T>())]
     pub unsafe fn downcast_unchecked<T: Any>(self) -> Box<T, A> {
         debug_assert!(self.is::<T>());
         unsafe {
@@ -450,6 +452,7 @@ impl<A: Allocator> Box<dyn Any + Send, A> {
     /// [`downcast`]: Self::downcast
     #[inline]
     #[unstable(feature = "downcast_unchecked", issue = "90850")]
+    #[requires(self.is::<T>())]
     pub unsafe fn downcast_unchecked<T: Any>(self) -> Box<T, A> {
         debug_assert!(self.is::<T>());
         unsafe {
@@ -509,6 +512,7 @@ impl<A: Allocator> Box<dyn Any + Send + Sync, A> {
     /// [`downcast`]: Self::downcast
     #[inline]
     #[unstable(feature = "downcast_unchecked", issue = "90850")]
+    #[requires(self.is::<T>())]
     pub unsafe fn downcast_unchecked<T: Any>(self) -> Box<T, A> {
         debug_assert!(self.is::<T>());
         unsafe {

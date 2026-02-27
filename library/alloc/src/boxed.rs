@@ -207,6 +207,7 @@ use crate::alloc::{AllocError, Allocator, Global, Layout};
 use crate::raw_vec::RawVec;
 #[cfg(not(no_global_oom_handling))]
 use crate::str::from_boxed_utf8_unchecked;
+use safety::requires;
 
 /// Conversion related impls for `Box<_>` (`From`, `downcast`, etc)
 mod convert;
@@ -941,6 +942,7 @@ impl<T, A: Allocator> Box<mem::MaybeUninit<T>, A> {
     /// ```
     #[stable(feature = "new_uninit", since = "1.82.0")]
     #[inline]
+    #[requires(true)] // Precondition: the MaybeUninit must be fully initialized (cannot be checked at runtime)
     pub unsafe fn assume_init(self) -> Box<T, A> {
         let (raw, alloc) = Box::into_raw_with_allocator(self);
         unsafe { Box::from_raw_in(raw as *mut T, alloc) }
@@ -1008,6 +1010,7 @@ impl<T, A: Allocator> Box<[mem::MaybeUninit<T>], A> {
     /// ```
     #[stable(feature = "new_uninit", since = "1.82.0")]
     #[inline]
+    #[requires(true)] // Precondition: all elements must be fully initialized (cannot be checked at runtime)
     pub unsafe fn assume_init(self) -> Box<[T], A> {
         let (raw, alloc) = Box::into_raw_with_allocator(self);
         unsafe { Box::from_raw_in(raw as *mut [T], alloc) }
@@ -1060,6 +1063,7 @@ impl<T: ?Sized> Box<T> {
     #[stable(feature = "box_raw", since = "1.4.0")]
     #[inline]
     #[must_use = "call `drop(Box::from_raw(ptr))` if you intend to drop the `Box`"]
+    #[requires(!raw.is_null())]
     pub unsafe fn from_raw(raw: *mut T) -> Self {
         unsafe { Self::from_raw_in(raw, Global) }
     }
@@ -1114,6 +1118,7 @@ impl<T: ?Sized> Box<T> {
     #[unstable(feature = "box_vec_non_null", reason = "new API", issue = "130364")]
     #[inline]
     #[must_use = "call `drop(Box::from_non_null(ptr))` if you intend to drop the `Box`"]
+    #[requires(ptr.as_ptr().is_aligned())]
     pub unsafe fn from_non_null(ptr: NonNull<T>) -> Self {
         unsafe { Self::from_raw(ptr.as_ptr()) }
     }
@@ -1287,6 +1292,7 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     /// [memory layout]: self#memory-layout
     #[unstable(feature = "allocator_api", issue = "32838")]
     #[inline]
+    #[requires(!raw.is_null())]
     pub unsafe fn from_raw_in(raw: *mut T, alloc: A) -> Self {
         Box(unsafe { Unique::new_unchecked(raw) }, alloc)
     }
@@ -1340,6 +1346,7 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     #[unstable(feature = "allocator_api", issue = "32838")]
     // #[unstable(feature = "box_vec_non_null", reason = "new API", issue = "130364")]
     #[inline]
+    #[requires(raw.as_ptr().is_aligned())]
     pub unsafe fn from_non_null_in(raw: NonNull<T>, alloc: A) -> Self {
         // SAFETY: guaranteed by the caller.
         unsafe { Box::from_raw_in(raw.as_ptr(), alloc) }
@@ -2158,5 +2165,639 @@ impl<E: Error> Error for Box<E> {
 
     fn provide<'b>(&'b self, request: &mut error::Request<'b>) {
         Error::provide(&**self, request);
+    }
+}
+
+// =====================================================================
+// Kani verification harnesses for Challenge 29: Safety of boxed
+// =====================================================================
+#[cfg(kani)]
+#[unstable(feature = "kani", issue = "none")]
+mod verify {
+    use super::*;
+    use core::any::Any;
+
+    // =================================================================
+    // UNSAFE FUNCTION HARNESSES
+    // =================================================================
+
+    // --- Box::from_raw round-trip ---
+
+    #[kani::proof]
+    fn check_from_raw_roundtrip_u8() {
+        let val: u8 = kani::any();
+        let b = Box::new(val);
+        let ptr = Box::into_raw(b);
+        let b2 = unsafe { Box::from_raw(ptr) };
+        assert_eq!(*b2, val);
+    }
+
+    #[kani::proof]
+    fn check_from_raw_roundtrip_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let ptr = Box::into_raw(b);
+        let b2 = unsafe { Box::from_raw(ptr) };
+        assert_eq!(*b2, val);
+    }
+
+    #[kani::proof]
+    fn check_from_raw_roundtrip_i64() {
+        let val: i64 = kani::any();
+        let b = Box::new(val);
+        let ptr = Box::into_raw(b);
+        let b2 = unsafe { Box::from_raw(ptr) };
+        assert_eq!(*b2, val);
+    }
+
+    // --- Box::from_non_null round-trip ---
+
+    #[kani::proof]
+    fn check_from_non_null_roundtrip_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let nn = Box::into_non_null(b);
+        let b2 = unsafe { Box::from_non_null(nn) };
+        assert_eq!(*b2, val);
+    }
+
+    // --- Box::from_raw_in round-trip ---
+
+    #[kani::proof]
+    fn check_from_raw_in_roundtrip_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let (ptr, alloc) = Box::into_raw_with_allocator(b);
+        let b2 = unsafe { Box::from_raw_in(ptr, alloc) };
+        assert_eq!(*b2, val);
+    }
+
+    // --- Box::from_non_null_in round-trip ---
+
+    #[kani::proof]
+    fn check_from_non_null_in_roundtrip_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let (nn, alloc) = Box::into_non_null_with_allocator(b);
+        let b2 = unsafe { Box::from_non_null_in(nn, alloc) };
+        assert_eq!(*b2, val);
+    }
+
+    // --- Box::assume_init (single value) ---
+
+    #[kani::proof]
+    fn check_assume_init_u8() {
+        let val: u8 = kani::any();
+        let mut b = Box::<u8>::new_uninit();
+        b.write(val);
+        let b = unsafe { b.assume_init() };
+        assert_eq!(*b, val);
+    }
+
+    #[kani::proof]
+    fn check_assume_init_u32() {
+        let val: u32 = kani::any();
+        let mut b = Box::<u32>::new_uninit();
+        b.write(val);
+        let b = unsafe { b.assume_init() };
+        assert_eq!(*b, val);
+    }
+
+    #[kani::proof]
+    fn check_assume_init_i64() {
+        let val: i64 = kani::any();
+        let mut b = Box::<i64>::new_uninit();
+        b.write(val);
+        let b = unsafe { b.assume_init() };
+        assert_eq!(*b, val);
+    }
+
+    // --- Box::assume_init (slice) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_assume_init_slice_u32() {
+        let a: u32 = kani::any();
+        let b: u32 = kani::any();
+        let c: u32 = kani::any();
+        let mut values = Box::<[u32]>::new_uninit_slice(3);
+        values[0].write(a);
+        values[1].write(b);
+        values[2].write(c);
+        let values = unsafe { values.assume_init() };
+        assert_eq!(values[0], a);
+        assert_eq!(values[1], b);
+        assert_eq!(values[2], c);
+    }
+
+    // --- downcast_unchecked (dyn Any) ---
+
+    #[kani::proof]
+    fn check_downcast_unchecked_any_u32() {
+        let val: u32 = kani::any();
+        let b: Box<dyn Any> = Box::new(val);
+        assert!(b.is::<u32>());
+        let b2: Box<u32> = unsafe { b.downcast_unchecked::<u32>() };
+        assert_eq!(*b2, val);
+    }
+
+    #[kani::proof]
+    fn check_downcast_unchecked_any_send_u32() {
+        let val: u32 = kani::any();
+        let b: Box<dyn Any + Send> = Box::new(val);
+        assert!(b.is::<u32>());
+        let b2: Box<u32> = unsafe { b.downcast_unchecked::<u32>() };
+        assert_eq!(*b2, val);
+    }
+
+    #[kani::proof]
+    fn check_downcast_unchecked_any_send_sync_u32() {
+        let val: u32 = kani::any();
+        let b: Box<dyn Any + Send + Sync> = Box::new(val);
+        assert!(b.is::<u32>());
+        let b2: Box<u32> = unsafe { b.downcast_unchecked::<u32>() };
+        assert_eq!(*b2, val);
+    }
+
+    // =================================================================
+    // SAFE-WITH-UNSAFE FUNCTION HARNESSES
+    // =================================================================
+
+    // --- Box::new_in (#1) ---
+
+    #[kani::proof]
+    fn check_new_in_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new_in(val, Global);
+        assert_eq!(*b, val);
+    }
+
+    // --- Box::try_new_in (#2) ---
+
+    #[kani::proof]
+    fn check_try_new_in_u32() {
+        let val: u32 = kani::any();
+        let result = Box::try_new_in(val, Global);
+        if let Ok(b) = result {
+            assert_eq!(*b, val);
+        }
+    }
+
+    // --- Box::try_new_uninit_in (#3) ---
+
+    #[kani::proof]
+    fn check_try_new_uninit_in_u32() {
+        if let Ok(mut b) = Box::<u32, _>::try_new_uninit_in(Global) {
+            let val: u32 = kani::any();
+            b.write(val);
+            let b = unsafe { b.assume_init() };
+            assert_eq!(*b, val);
+        }
+    }
+
+    // --- Box::try_new_zeroed_in (#4) ---
+
+    #[kani::proof]
+    fn check_try_new_zeroed_in_u32() {
+        if let Ok(b) = Box::<u32, _>::try_new_zeroed_in(Global) {
+            let b = unsafe { b.assume_init() };
+            assert_eq!(*b, 0u32);
+        }
+    }
+
+    // --- Box::into_boxed_slice (#5) ---
+
+    #[kani::proof]
+    fn check_into_boxed_slice_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new_in(val, Global);
+        let slice = Box::into_boxed_slice(b);
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0], val);
+    }
+
+    // --- Box::new_uninit_slice (#6) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_new_uninit_slice_u32() {
+        let mut values = Box::<[u32]>::new_uninit_slice(3);
+        values[0].write(10);
+        values[1].write(20);
+        values[2].write(30);
+        let values = unsafe { values.assume_init() };
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0], 10);
+    }
+
+    // --- Box::new_zeroed_slice (#7) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_new_zeroed_slice_u32() {
+        let values = Box::<[u32]>::new_zeroed_slice(3);
+        let values = unsafe { values.assume_init() };
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0], 0);
+        assert_eq!(values[1], 0);
+        assert_eq!(values[2], 0);
+    }
+
+    // --- Box::try_new_uninit_slice (#8) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_try_new_uninit_slice_u32() {
+        if let Ok(mut values) = Box::<[u32]>::try_new_uninit_slice(3) {
+            values[0].write(1);
+            values[1].write(2);
+            values[2].write(3);
+            let values = unsafe { values.assume_init() };
+            assert_eq!(values.len(), 3);
+        }
+    }
+
+    // --- Box::try_new_zeroed_slice (#9) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_try_new_zeroed_slice_u32() {
+        if let Ok(values) = Box::<[u32]>::try_new_zeroed_slice(3) {
+            let values = unsafe { values.assume_init() };
+            assert_eq!(values[0], 0);
+        }
+    }
+
+    // --- Box::into_array (#10) ---
+
+    #[kani::proof]
+    fn check_into_array_u32() {
+        let b: Box<[u32]> = Box::new([1u32, 2, 3]);
+        if let Some(arr) = b.into_array::<3>() {
+            assert_eq!(arr[0], 1);
+            assert_eq!(arr[1], 2);
+            assert_eq!(arr[2], 3);
+        }
+    }
+
+    #[kani::proof]
+    fn check_into_array_wrong_len() {
+        let b: Box<[u32]> = Box::new([1u32, 2, 3]);
+        let result = b.into_array::<2>();
+        assert!(result.is_none());
+    }
+
+    // --- Box::new_uninit_slice_in (#11) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_new_uninit_slice_in_u32() {
+        let mut values = Box::<u32, Global>::new_uninit_slice_in(3, Global);
+        values[0].write(10);
+        values[1].write(20);
+        values[2].write(30);
+        let values = unsafe { values.assume_init() };
+        assert_eq!(values.len(), 3);
+    }
+
+    // --- Box::new_zeroed_slice_in (#12) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_new_zeroed_slice_in_u32() {
+        let values = Box::<u32, Global>::new_zeroed_slice_in(3, Global);
+        let values = unsafe { values.assume_init() };
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0], 0);
+    }
+
+    // --- Box::try_new_uninit_slice_in (#13) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_try_new_uninit_slice_in_u32() {
+        if let Ok(mut values) = Box::<u32, Global>::try_new_uninit_slice_in(3, Global) {
+            values[0].write(1);
+            values[1].write(2);
+            values[2].write(3);
+            let values = unsafe { values.assume_init() };
+            assert_eq!(values.len(), 3);
+        }
+    }
+
+    // --- Box::try_new_zeroed_slice_in (#14) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_try_new_zeroed_slice_in_u32() {
+        if let Ok(values) = Box::<u32, Global>::try_new_zeroed_slice_in(3, Global) {
+            let values = unsafe { values.assume_init() };
+            assert_eq!(values[0], 0);
+        }
+    }
+
+    // --- Box::write (MaybeUninit) (#15) ---
+
+    #[kani::proof]
+    fn check_write_maybeuninit_u32() {
+        let val: u32 = kani::any();
+        let b = Box::<u32>::new_uninit();
+        let b = Box::write(b, val);
+        assert_eq!(*b, val);
+    }
+
+    // --- Box::into_non_null (#16) ---
+
+    #[kani::proof]
+    fn check_into_non_null_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let nn = Box::into_non_null(b);
+        // Reconstruct to avoid leak and verify value
+        let b2 = unsafe { Box::from_non_null(nn) };
+        assert_eq!(*b2, val);
+    }
+
+    // --- Box::into_raw_with_allocator (#17) ---
+
+    #[kani::proof]
+    fn check_into_raw_with_allocator_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let (ptr, alloc) = Box::into_raw_with_allocator(b);
+        assert!(!ptr.is_null());
+        // Reconstruct to avoid leak
+        let b2 = unsafe { Box::from_raw_in(ptr, alloc) };
+        assert_eq!(*b2, val);
+    }
+
+    // --- Box::into_non_null_with_allocator (#18) ---
+
+    #[kani::proof]
+    fn check_into_non_null_with_allocator_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let (nn, alloc) = Box::into_non_null_with_allocator(b);
+        // Reconstruct to avoid leak
+        let b2 = unsafe { Box::from_non_null_in(nn, alloc) };
+        assert_eq!(*b2, val);
+    }
+
+    // --- Box::into_unique (#19) ---
+
+    #[kani::proof]
+    fn check_into_unique_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let (uniq, alloc) = Box::into_unique(b);
+        // Reconstruct to avoid leak
+        let b2 = unsafe { Box::from_raw_in(uniq.as_ptr(), alloc) };
+        assert_eq!(*b2, val);
+    }
+
+    // --- Box::leak (#20) ---
+
+    #[kani::proof]
+    fn check_leak_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let r: &mut u32 = Box::leak(b);
+        assert_eq!(*r, val);
+        // Reclaim to avoid actual leak in test
+        let _ = unsafe { Box::from_raw(r as *mut u32) };
+    }
+
+    // --- Box::into_pin (#21) ---
+
+    #[kani::proof]
+    fn check_into_pin_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let pinned: Pin<Box<u32>> = Box::into_pin(b);
+        assert_eq!(*pinned, val);
+    }
+
+    // --- Drop for Box (#22) ---
+
+    #[kani::proof]
+    fn check_drop_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        drop(b); // Should not panic or cause UB
+    }
+
+    #[kani::proof]
+    fn check_drop_zst() {
+        let b: Box<()> = Box::new(());
+        drop(b); // ZST drop should be safe
+    }
+
+    // --- Default for Box<T> (#23) ---
+
+    #[kani::proof]
+    fn check_default_box_u32() {
+        let b: Box<u32> = Box::default();
+        assert_eq!(*b, 0u32);
+    }
+
+    #[kani::proof]
+    fn check_default_box_bool() {
+        let b: Box<bool> = Box::default();
+        assert_eq!(*b, false);
+    }
+
+    // --- Default for Box<str> (#24) ---
+
+    #[kani::proof]
+    fn check_default_box_str() {
+        let b: Box<str> = Default::default();
+        assert_eq!(&*b, "");
+        assert_eq!(b.len(), 0);
+    }
+
+    // --- Clone for Box<T, A> (#25) ---
+
+    #[kani::proof]
+    fn check_clone_box_u32() {
+        let val: u32 = kani::any();
+        let b = Box::new(val);
+        let b2 = b.clone();
+        assert_eq!(*b, *b2);
+        assert_eq!(*b2, val);
+    }
+
+    // --- Clone for Box<str> (#26) ---
+
+    #[kani::proof]
+    fn check_clone_box_str() {
+        let b: Box<str> = Default::default();
+        let b2 = b.clone();
+        assert_eq!(&*b, &*b2);
+    }
+
+    // --- BoxFromSlice<T>::from_slice (#27) ---
+
+    #[kani::proof]
+    fn check_box_from_slice_u8() {
+        let slice: &[u8] = &[1u8, 2, 3];
+        let b: Box<[u8]> = Box::from(slice);
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[0], 1);
+        assert_eq!(b[1], 2);
+        assert_eq!(b[2], 3);
+    }
+
+    // --- From<&str> for Box<str> (#28) ---
+
+    #[kani::proof]
+    fn check_box_from_str() {
+        let s: &str = "hi";
+        let b: Box<str> = Box::from(s);
+        assert_eq!(&*b, "hi");
+    }
+
+    // --- From<Box<str, A>> for Box<[u8], A> (#29) ---
+
+    #[kani::proof]
+    fn check_box_str_to_box_u8() {
+        let b: Box<str> = Box::from("abc");
+        let bytes: Box<[u8]> = Box::from(b);
+        assert_eq!(bytes.len(), 3);
+        assert_eq!(bytes[0], b'a');
+    }
+
+    // --- TryFrom<Box<[T]>> for Box<[T; N]> (#30) ---
+
+    #[kani::proof]
+    fn check_try_from_boxed_slice_to_array() {
+        let b: Box<[u32]> = Box::new([1u32, 2, 3]);
+        let result: Result<Box<[u32; 3]>, _> = b.try_into();
+        assert!(result.is_ok());
+        let arr = result.unwrap();
+        assert_eq!(arr[0], 1);
+        assert_eq!(arr[1], 2);
+        assert_eq!(arr[2], 3);
+    }
+
+    // --- TryFrom<Vec<T>> for Box<[T; N]> (#31) ---
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn check_try_from_vec_to_array() {
+        let v: crate::vec::Vec<u32> = crate::vec![1u32, 2, 3];
+        let result: Result<Box<[u32; 3]>, _> = v.try_into();
+        assert!(result.is_ok());
+        let arr = result.unwrap();
+        assert_eq!(arr[0], 1);
+    }
+
+    // --- Box<dyn Any>::downcast (#32) ---
+
+    #[kani::proof]
+    fn check_downcast_any_success() {
+        let val: u32 = kani::any();
+        let b: Box<dyn Any> = Box::new(val);
+        let result = b.downcast::<u32>();
+        assert!(result.is_ok());
+        assert_eq!(*result.unwrap(), val);
+    }
+
+    #[kani::proof]
+    fn check_downcast_any_failure() {
+        let val: u32 = kani::any();
+        let b: Box<dyn Any> = Box::new(val);
+        let result = b.downcast::<i64>();
+        assert!(result.is_err());
+    }
+
+    // --- Box<dyn Any + Send>::downcast (#33) ---
+
+    #[kani::proof]
+    fn check_downcast_any_send_success() {
+        let val: u32 = kani::any();
+        let b: Box<dyn Any + Send> = Box::new(val);
+        let result = b.downcast::<u32>();
+        assert!(result.is_ok());
+        assert_eq!(*result.unwrap(), val);
+    }
+
+    // --- Box<dyn Any + Send + Sync>::downcast (#34) ---
+
+    #[kani::proof]
+    fn check_downcast_any_send_sync_success() {
+        let val: u32 = kani::any();
+        let b: Box<dyn Any + Send + Sync> = Box::new(val);
+        let result = b.downcast::<u32>();
+        assert!(result.is_ok());
+        assert_eq!(*result.unwrap(), val);
+    }
+
+    // --- dyn Error downcast (#35, #36, #37) ---
+
+    #[kani::proof]
+    fn check_downcast_error() {
+        use core::fmt;
+        #[derive(Debug)]
+        struct TestErr(u32);
+        impl fmt::Display for TestErr {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl Error for TestErr {}
+
+        let val: u32 = kani::any();
+        let b: Box<dyn Error> = Box::new(TestErr(val));
+        let result = b.downcast::<TestErr>();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0, val);
+    }
+
+    #[kani::proof]
+    fn check_downcast_error_send() {
+        use core::fmt;
+        #[derive(Debug)]
+        struct TestErrorSend(u32);
+        impl fmt::Display for TestErrorSend {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl Error for TestErrorSend {}
+        // TestErrorSend is Send automatically since u32: Send
+
+        let val: u32 = kani::any();
+        let b: Box<dyn Error + Send> = Box::new(TestErrorSend(val));
+        let result = b.downcast::<TestErrorSend>();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0, val);
+    }
+
+    #[kani::proof]
+    fn check_downcast_error_send_sync() {
+        use core::fmt;
+        #[derive(Debug)]
+        struct TestErrorSendSync(u32);
+        impl fmt::Display for TestErrorSendSync {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl Error for TestErrorSendSync {}
+        // TestErrorSendSync is Send+Sync automatically since u32: Send+Sync
+
+        let val: u32 = kani::any();
+        let b: Box<dyn Error + Send + Sync> = Box::new(TestErrorSendSync(val));
+        let result = b.downcast::<TestErrorSendSync>();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0, val);
+    }
+
+    // --- Default for Box<[T]> (bonus) ---
+
+    #[kani::proof]
+    fn check_default_box_slice() {
+        let b: Box<[u32]> = Default::default();
+        assert_eq!(b.len(), 0);
     }
 }
