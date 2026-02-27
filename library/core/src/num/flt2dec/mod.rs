@@ -666,3 +666,567 @@ where
         }
     }
 }
+
+// =====================================================================
+// Kani verification harnesses for Challenge 28: flt2dec safety
+// =====================================================================
+#[cfg(kani)]
+#[unstable(feature = "kani", issue = "none")]
+mod verify {
+    use super::*;
+    use crate::mem::MaybeUninit;
+
+    // =================================================================
+    // Helper: create a properly sized parts buffer
+    // =================================================================
+
+    const PARTS_LEN: usize = 6;
+    const BUF_LEN: usize = 128;
+
+    // =================================================================
+    // 1. digits_to_dec_str
+    // =================================================================
+
+    // Case: exp <= 0 (decimal point before digits)
+    #[kani::proof]
+    fn check_digits_to_dec_str_exp_neg() {
+        let buf = b"12345";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_dec_str(buf, -2, 0, &mut parts);
+        assert!(result.len() >= 2);
+    }
+
+    // Case: exp <= 0, with frac_digits padding
+    #[kani::proof]
+    fn check_digits_to_dec_str_exp_neg_frac() {
+        let buf = b"12345";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_dec_str(buf, -2, 20, &mut parts);
+        assert!(result.len() >= 3);
+    }
+
+    // Case: exp > 0, decimal point inside digits
+    #[kani::proof]
+    fn check_digits_to_dec_str_exp_mid() {
+        let buf = b"12345";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_dec_str(buf, 3, 0, &mut parts);
+        assert!(result.len() >= 3);
+    }
+
+    // Case: exp > 0, decimal point inside digits, with frac_digits
+    #[kani::proof]
+    fn check_digits_to_dec_str_exp_mid_frac() {
+        let buf = b"12345";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_dec_str(buf, 3, 10, &mut parts);
+        assert!(result.len() >= 3);
+    }
+
+    // Case: exp >= buf.len(), decimal point after digits
+    #[kani::proof]
+    fn check_digits_to_dec_str_exp_after() {
+        let buf = b"12345";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_dec_str(buf, 8, 0, &mut parts);
+        assert!(result.len() >= 2);
+    }
+
+    // Case: exp >= buf.len(), with frac_digits
+    #[kani::proof]
+    fn check_digits_to_dec_str_exp_after_frac() {
+        let buf = b"12345";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_dec_str(buf, 8, 5, &mut parts);
+        assert!(result.len() >= 2);
+    }
+
+    // =================================================================
+    // 2. digits_to_exp_str
+    // =================================================================
+
+    #[kani::proof]
+    fn check_digits_to_exp_str_single_digit() {
+        let buf = b"5";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_exp_str(buf, 3, 0, false, &mut parts);
+        assert!(result.len() >= 3); // digit, e, num
+    }
+
+    #[kani::proof]
+    fn check_digits_to_exp_str_multi_digit() {
+        let buf = b"12345";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_exp_str(buf, 5, 0, false, &mut parts);
+        assert!(result.len() >= 4); // digit, dot, rest, e, num
+    }
+
+    #[kani::proof]
+    fn check_digits_to_exp_str_upper() {
+        let buf = b"12345";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_exp_str(buf, 5, 0, true, &mut parts);
+        assert!(result.len() >= 4);
+    }
+
+    #[kani::proof]
+    fn check_digits_to_exp_str_neg_exp() {
+        let buf = b"12345";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_exp_str(buf, -3, 0, false, &mut parts);
+        assert!(result.len() >= 4);
+    }
+
+    #[kani::proof]
+    fn check_digits_to_exp_str_min_ndigits() {
+        let buf = b"12";
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = digits_to_exp_str(buf, 1, 10, false, &mut parts);
+        assert!(result.len() >= 5); // digit, dot, rest, zeros, e, num
+    }
+
+    // =================================================================
+    // 3. to_shortest_str (f32)
+    // =================================================================
+
+    #[kani::proof]
+    fn check_to_shortest_str_f32_nan() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_str(
+            strategy::grisu::format_shortest,
+            f32::NAN, Sign::Minus, 0, &mut buf, &mut parts,
+        );
+        assert!(result.sign == "");
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_str_f32_inf() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_str(
+            strategy::grisu::format_shortest,
+            f32::INFINITY, Sign::Minus, 0, &mut buf, &mut parts,
+        );
+        assert!(result.sign == "");
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_str_f32_neg_inf() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_str(
+            strategy::grisu::format_shortest,
+            f32::NEG_INFINITY, Sign::Minus, 0, &mut buf, &mut parts,
+        );
+        assert!(result.sign == "-");
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_str_f32_zero() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_str(
+            strategy::grisu::format_shortest,
+            0.0f32, Sign::Minus, 0, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_str_f32_zero_frac() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_str(
+            strategy::grisu::format_shortest,
+            0.0f32, Sign::Minus, 5, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 2);
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_str_f32_one() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_str(
+            strategy::grisu::format_shortest,
+            1.0f32, Sign::Minus, 0, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    // =================================================================
+    // 4. to_shortest_exp_str (f32)
+    // =================================================================
+
+    #[kani::proof]
+    fn check_to_shortest_exp_str_f32_nan() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_exp_str(
+            strategy::grisu::format_shortest,
+            f32::NAN, Sign::Minus, (-4, 16), false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_exp_str_f32_inf() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_exp_str(
+            strategy::grisu::format_shortest,
+            f32::INFINITY, Sign::Minus, (-4, 16), false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_exp_str_f32_zero() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_exp_str(
+            strategy::grisu::format_shortest,
+            0.0f32, Sign::Minus, (-4, 16), false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_exp_str_f32_one() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_exp_str(
+            strategy::grisu::format_shortest,
+            1.0f32, Sign::Minus, (-4, 16), false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_exp_str_f32_large() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_exp_str(
+            strategy::grisu::format_shortest,
+            1.23e20f32, Sign::MinusPlus, (-4, 16), true, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    // =================================================================
+    // 5. to_exact_exp_str (f32)
+    // =================================================================
+
+    #[kani::proof]
+    fn check_to_exact_exp_str_f32_nan() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_exp_str(
+            strategy::grisu::format_exact,
+            f32::NAN, Sign::Minus, 5, false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_exp_str_f32_inf() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_exp_str(
+            strategy::grisu::format_exact,
+            f32::INFINITY, Sign::Minus, 5, false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_exp_str_f32_zero_multi() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_exp_str(
+            strategy::grisu::format_exact,
+            0.0f32, Sign::Minus, 5, false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 3); // "0." + zeros + "e0"
+    }
+
+    #[kani::proof]
+    fn check_to_exact_exp_str_f32_zero_single() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_exp_str(
+            strategy::grisu::format_exact,
+            0.0f32, Sign::Minus, 1, false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_exp_str_f32_one() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_exp_str(
+            strategy::grisu::format_exact,
+            1.0f32, Sign::Minus, 5, false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    // =================================================================
+    // 6. to_exact_fixed_str (f32)
+    // =================================================================
+
+    #[kani::proof]
+    fn check_to_exact_fixed_str_f32_nan() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_fixed_str(
+            strategy::grisu::format_exact,
+            f32::NAN, Sign::Minus, 5, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_fixed_str_f32_inf() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_fixed_str(
+            strategy::grisu::format_exact,
+            f32::INFINITY, Sign::Minus, 5, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_fixed_str_f32_zero() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_fixed_str(
+            strategy::grisu::format_exact,
+            0.0f32, Sign::Minus, 5, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 2);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_fixed_str_f32_zero_nofrac() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_fixed_str(
+            strategy::grisu::format_exact,
+            0.0f32, Sign::Minus, 0, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_fixed_str_f32_one() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_fixed_str(
+            strategy::grisu::format_exact,
+            1.0f32, Sign::Minus, 5, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_fixed_str_f32_small() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_fixed_str(
+            strategy::grisu::format_exact,
+            0.001f32, Sign::Minus, 5, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    // =================================================================
+    // 7-8. Grisu format_shortest_opt / format_shortest
+    // =================================================================
+
+    #[kani::proof]
+    fn check_grisu_format_shortest_f32_one() {
+        let (_, full) = decode(1.0f32);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+            let (digits, exp) = strategy::grisu::format_shortest(decoded, &mut buf);
+            assert!(!digits.is_empty());
+            assert!(digits[0] >= b'1' && digits[0] <= b'9');
+        }
+    }
+
+    #[kani::proof]
+    fn check_grisu_format_shortest_opt_f32_one() {
+        let (_, full) = decode(1.0f32);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+            if let Some((digits, exp)) = strategy::grisu::format_shortest_opt(decoded, &mut buf) {
+                assert!(!digits.is_empty());
+                assert!(digits[0] >= b'1' && digits[0] <= b'9');
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn check_grisu_format_shortest_f64_pi() {
+        let (_, full) = decode(3.141592653589793f64);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+            let (digits, exp) = strategy::grisu::format_shortest(decoded, &mut buf);
+            assert!(!digits.is_empty());
+        }
+    }
+
+    // =================================================================
+    // 9-10. Grisu format_exact_opt / format_exact
+    // =================================================================
+
+    #[kani::proof]
+    fn check_grisu_format_exact_f32_one() {
+        let (_, full) = decode(1.0f32);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; 20] = [const { MaybeUninit::uninit() }; 20];
+            let (digits, exp) = strategy::grisu::format_exact(decoded, &mut buf, i16::MIN);
+            assert!(!digits.is_empty());
+        }
+    }
+
+    #[kani::proof]
+    fn check_grisu_format_exact_opt_f32_one() {
+        let (_, full) = decode(1.0f32);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; 20] = [const { MaybeUninit::uninit() }; 20];
+            if let Some((digits, exp)) = strategy::grisu::format_exact_opt(decoded, &mut buf, i16::MIN) {
+                assert!(!digits.is_empty());
+            }
+        }
+    }
+
+    #[kani::proof]
+    fn check_grisu_format_exact_f64_pi() {
+        let (_, full) = decode(3.141592653589793f64);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; 20] = [const { MaybeUninit::uninit() }; 20];
+            let (digits, exp) = strategy::grisu::format_exact(decoded, &mut buf, i16::MIN);
+            assert!(!digits.is_empty());
+        }
+    }
+
+    // =================================================================
+    // 11-12. Dragon format_shortest / format_exact
+    // =================================================================
+
+    #[kani::proof]
+    fn check_dragon_format_shortest_f32_one() {
+        let (_, full) = decode(1.0f32);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+            let (digits, exp) = strategy::dragon::format_shortest(decoded, &mut buf);
+            assert!(!digits.is_empty());
+            assert!(digits[0] >= b'1' && digits[0] <= b'9');
+        }
+    }
+
+    #[kani::proof]
+    fn check_dragon_format_exact_f32_one() {
+        let (_, full) = decode(1.0f32);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; 20] = [const { MaybeUninit::uninit() }; 20];
+            let (digits, exp) = strategy::dragon::format_exact(decoded, &mut buf, i16::MIN);
+            assert!(!digits.is_empty());
+        }
+    }
+
+    #[kani::proof]
+    fn check_dragon_format_shortest_f64_pi() {
+        let (_, full) = decode(3.141592653589793f64);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+            let (digits, exp) = strategy::dragon::format_shortest(decoded, &mut buf);
+            assert!(!digits.is_empty());
+        }
+    }
+
+    #[kani::proof]
+    fn check_dragon_format_exact_f64_pi() {
+        let (_, full) = decode(3.141592653589793f64);
+        if let FullDecoded::Finite(ref decoded) = full {
+            let mut buf: [MaybeUninit<u8>; 20] = [const { MaybeUninit::uninit() }; 20];
+            let (digits, exp) = strategy::dragon::format_exact(decoded, &mut buf, i16::MIN);
+            assert!(!digits.is_empty());
+        }
+    }
+
+    // =================================================================
+    // Additional f64 coverage for top-level functions
+    // =================================================================
+
+    #[kani::proof]
+    fn check_to_shortest_str_f64_one() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_str(
+            strategy::grisu::format_shortest,
+            1.0f64, Sign::Minus, 0, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_exp_str_f64_large() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_exp_str(
+            strategy::grisu::format_shortest,
+            1.23e100f64, Sign::Minus, (-4, 16), false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_exp_str_f64_one() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_exp_str(
+            strategy::grisu::format_exact,
+            1.0f64, Sign::Minus, 10, false, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_exact_fixed_str_f64_one() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_exact_fixed_str(
+            strategy::grisu::format_exact,
+            1.0f64, Sign::Minus, 10, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_str_f32_neg() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_str(
+            strategy::grisu::format_shortest,
+            -42.5f32, Sign::Minus, 0, &mut buf, &mut parts,
+        );
+        assert!(result.sign == "-");
+    }
+
+    #[kani::proof]
+    fn check_to_shortest_str_f32_min_positive() {
+        let mut buf: [MaybeUninit<u8>; BUF_LEN] = [const { MaybeUninit::uninit() }; BUF_LEN];
+        let mut parts: [MaybeUninit<Part<'_>>; PARTS_LEN] = [const { MaybeUninit::uninit() }; PARTS_LEN];
+        let result = to_shortest_str(
+            strategy::grisu::format_shortest,
+            f32::MIN_POSITIVE, Sign::Minus, 0, &mut buf, &mut parts,
+        );
+        assert!(result.parts.len() >= 1);
+    }
+}
