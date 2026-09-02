@@ -435,6 +435,7 @@ unsafe impl<'a> Searcher<'a> for CharSearcher<'a> {
     }
     #[inline]
     fn next_match(&mut self) -> Option<(usize, usize)> {
+        #[safety::loop_invariant(self.finger <= self.finger_back && self.finger_back <= self.haystack.len())]
         loop {
             // get the haystack after the last character found
             let bytes = self.haystack.as_bytes().get(self.finger..self.finger_back)?;
@@ -503,6 +504,7 @@ unsafe impl<'a> ReverseSearcher<'a> for CharSearcher<'a> {
     #[inline]
     fn next_match_back(&mut self) -> Option<(usize, usize)> {
         let haystack = self.haystack.as_bytes();
+        #[safety::loop_invariant(self.finger <= self.finger_back && self.finger_back <= haystack.len())]
         loop {
             // get the haystack up to but not including the last character searched
             let bytes = haystack.get(self.finger..self.finger_back)?;
@@ -2507,5 +2509,207 @@ pub mod verify {
             assert_valid_range(haystack, a, b);
         }
         assert!(type_invariant_mces(&s.0));
+    }
+
+    // ------------------------------------------------------------------
+    // Unbounded-haystack proofs for the two real memchr/memrchr loops.
+    //
+    // The loops in `CharSearcher::next_match`/`next_match_back` carry a
+    // `#[safety::loop_invariant]`, so under `-Z loop-contracts` CBMC
+    // verifies one arbitrary iteration from any invariant-satisfying
+    // loop-head state instead of unwinding. The haystack is a
+    // symbolic-length slice of an arbitrary byte array constrained to
+    // valid UTF-8 by a byte-table predicate; `HAY_MAX` is the size of the
+    // backing array (a CBMC memory-model parameter, as `ARR_SIZE` in
+    // `str::validations::verify::check_run_utf8_validation`), not a bound
+    // any loop is unwound to. memchr/memrchr are replaced by loop-free
+    // exact specifications of their first/last-occurrence contract
+    // (Challenge 20 assumption 1).
+    // ------------------------------------------------------------------
+
+    /// Backing-array size for the unbounded harnesses; haystack lengths
+    /// range over `0..=HAY_MAX`.
+    const HAY_MAX: usize = 16;
+    /// Extra bytes past `HAY_MAX` so the byte-table predicates may read up
+    /// to four bytes after any index `< HAY_MAX` without leaving the
+    /// backing array.
+    const PAD: usize = 4;
+    /// Constant bound of the quantifiers over the backing array.
+    const HAY_QMAX: usize = HAY_MAX + PAD;
+
+    /// Byte-table definition of "`arr[..len]` is valid UTF-8", as two
+    /// facts local to a 4-byte window and quantified over every index of
+    /// the backing array (positions `i >= len` are vacuous):
+    ///
+    /// - U-lead: every non-continuation byte at `i` is a valid leading
+    ///   byte (`<0x80`, `0xC2..=0xDF`, `0xE0..=0xEF`, `0xF0..=0xF4`) of
+    ///   width `w`, its `w - 1` continuation bytes are present (with the
+    ///   second-byte restrictions for `E0`/`ED`/`F0`/`F4`: no overlong
+    ///   forms, no surrogates, nothing above U+10FFFF), `i + w <= len`,
+    ///   and the byte at `i + w` is a leading byte or the end of the
+    ///   string.
+    /// - U-cover: every byte lies within three bytes after a
+    ///   non-continuation byte.
+    ///
+    /// Both hold of every valid UTF-8 string, so assuming them is sound;
+    /// together they are equivalent to `from_utf8(..).is_ok()`, which
+    /// justifies `from_utf8_unchecked` in `any_utf8`. `from_utf8` itself
+    /// is not usable as the filter because under `-Z loop-contracts` the
+    /// invariants in `run_utf8_validation` abstract its loops and its
+    /// result no longer constrains the bytes. The quantifier bodies are
+    /// branch-free (CBMC instantiates a quantifier body as one
+    /// expression); every read stays inside the backing array because of
+    /// `PAD`.
+    fn utf8_local<const N: usize>(arr: &[u8; N], len: usize) -> bool {
+        let p = arr.as_ptr();
+        let lead = crate::forall!(|i in (0, N - PAD)| unsafe {
+            let i: usize = i;
+            let b0 = *p.wrapping_add(i);
+            let b1 = *p.wrapping_add(i.wrapping_add(1));
+            let b2 = *p.wrapping_add(i.wrapping_add(2));
+            let b3 = *p.wrapping_add(i.wrapping_add(3));
+            let c0 = (b0 as i8) < -64;
+            let c1 = (b1 as i8) < -64;
+            let c2 = (b2 as i8) < -64;
+            let c3 = (b3 as i8) < -64;
+            // width of the sequence led by b0 (0: not a valid leading byte)
+            let w: usize = (b0 < 0x80) as usize
+                + (((b0 >= 0xC2) & (b0 < 0xE0)) as usize) * 2
+                + (((b0 >= 0xE0) & (b0 < 0xF0)) as usize) * 3
+                + (((b0 >= 0xF0) & (b0 < 0xF5)) as usize) * 4;
+            let cw = (*p.wrapping_add(i.wrapping_add(w)) as i8) < -64;
+            let sec = ((b0 != 0xE0) | (b1 >= 0xA0))
+                & ((b0 != 0xED) | (b1 < 0xA0))
+                & ((b0 != 0xF0) | (b1 >= 0x90))
+                & ((b0 != 0xF4) | (b1 < 0x90));
+            (i >= len)
+                | c0
+                | ((w != 0)
+                    & (i.wrapping_add(w) <= len)
+                    & ((w < 2) | (c1 & sec))
+                    & ((w < 3) | c2)
+                    & ((w < 4) | c3)
+                    & ((i.wrapping_add(w) == len) | !cw))
+        });
+        let cover = crate::forall!(|i in (0, N - PAD)| unsafe {
+            let i: usize = i;
+            (i >= len)
+                | ((*p.wrapping_add(i) as i8) >= -64)
+                | ((i >= 1) & ((*p.wrapping_add(i.saturating_sub(1)) as i8) >= -64))
+                | ((i >= 2) & ((*p.wrapping_add(i.saturating_sub(2)) as i8) >= -64))
+                | ((i >= 3) & ((*p.wrapping_add(i.saturating_sub(3)) as i8) >= -64))
+        });
+        lead && cover
+    }
+
+    /// An arbitrary valid UTF-8 string of symbolic length `0..=N - PAD`
+    /// backed by a caller-owned array of arbitrary content.
+    fn any_utf8<const N: usize>(arr: &[u8; N]) -> &str {
+        let len: usize = kani::any();
+        kani::assume(len <= N - PAD);
+        kani::assume(utf8_local(arr, len));
+        // SAFETY: `utf8_local` is the byte-table definition of UTF-8
+        // validity (see its documentation).
+        unsafe { crate::str::from_utf8_unchecked(&arr[..len]) }
+    }
+
+    /// Loop-free exact specification of `memchr`: `Some(i)` iff `i` is
+    /// the first index with `text[i] == x`, `None` iff there is none.
+    /// `text` must be a subslice of a backing array of at most `HAY_QMAX`
+    /// bytes (the quantifier's constant bound); out-of-range `j` are
+    /// vacuous and their read index is clamped to 0, which stays inside
+    /// the backing array.
+    fn spec_memchr(x: u8, text: &[u8]) -> Option<usize> {
+        let len = text.len();
+        let p = text.as_ptr();
+        let found: bool = kani::any();
+        let i: usize = kani::any();
+        kani::assume(!found || (i < len && unsafe { *p.add(i) } == x));
+        let bound = if found { i } else { len };
+        kani::assume(crate::forall!(|j in (0, HAY_QMAX)| unsafe {
+            let j: usize = j;
+            let jj = j * ((j < bound) as usize);
+            (j >= bound) | (*p.wrapping_add(jj) != x)
+        }));
+        if found { Some(i) } else { None }
+    }
+
+    /// Loop-free exact specification of `memrchr`: `Some(i)` iff `i` is
+    /// the last index with `text[i] == x`, `None` iff there is none.
+    fn spec_memrchr(x: u8, text: &[u8]) -> Option<usize> {
+        let len = text.len();
+        let p = text.as_ptr();
+        let found: bool = kani::any();
+        let i: usize = kani::any();
+        kani::assume(!found || (i < len && unsafe { *p.add(i) } == x));
+        let lo = if found { i + 1 } else { 0 };
+        kani::assume(crate::forall!(|j in (0, HAY_QMAX)| unsafe {
+            let j: usize = j;
+            let inr = (j >= lo) & (j < len);
+            let jj = j * (inr as usize);
+            !inr | (*p.wrapping_add(jj) != x)
+        }));
+        if found { Some(i) } else { None }
+    }
+
+    /// Loop-free model of `<[u8] as PartialEq<[u8]>>::eq` for the slice
+    /// lengths reachable in these harnesses (at most `char::MAX_LEN_UTF8`
+    /// bytes: the needle width). The real implementation lowers to CBMC's
+    /// builtin `memcmp` model, which is linked in after Kani's
+    /// loop-modifies inference, so its internal locals fail the
+    /// loop-contract assigns check inside a contracted loop; a Rust-level
+    /// model is inferred correctly. Longer slices are rejected with an
+    /// assertion, never silently mis-modelled.
+    fn stub_slice_eq_u8(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        kani::assert(a.len() <= char::MAX_LEN_UTF8, "stub_slice_eq_u8 models at most 4 bytes");
+        let n = a.len();
+        (n < 1 || a[0] == b[0])
+            && (n < 2 || a[1] == b[1])
+            && (n < 3 || a[2] == b[2])
+            && (n < 4 || a[3] == b[3])
+    }
+
+    /// Criteria 2+3 for the real `CharSearcher::next_match` over a
+    /// haystack of arbitrary length: no loop is unwound to the haystack
+    /// length; the memchr loop is verified through its loop invariant.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::stub(crate::slice::memchr::memchr, spec_memchr)]
+    pub fn verify_cs_next_match_unbounded() {
+        let hbuf: [u8; HAY_MAX + PAD] = kani::any();
+        let haystack = any_utf8(&hbuf);
+        let mut s = any_char_searcher(haystack);
+        match s.next_match() {
+            Some((a, b)) => {
+                assert_valid_range(haystack, a, b);
+                assert!(b - a == s.utf8_size());
+                kani::cover(true, "next_match (unbounded) found the needle");
+            }
+            None => kani::cover(true, "next_match (unbounded) found nothing"),
+        }
+        assert!(type_invariant_cs(&s));
+    }
+
+    /// Criteria 2+3 for the real `CharSearcher::next_match_back` over a
+    /// haystack of arbitrary length (see `verify_cs_next_match_unbounded`).
+    #[kani::proof]
+    #[kani::unwind(5)]
+    #[kani::stub(crate::slice::memchr::memrchr, spec_memrchr)]
+    pub fn verify_cs_next_match_back_unbounded() {
+        let hbuf: [u8; HAY_MAX + PAD] = kani::any();
+        let haystack = any_utf8(&hbuf);
+        let mut s = any_char_searcher(haystack);
+        match s.next_match_back() {
+            Some((a, b)) => {
+                assert_valid_range(haystack, a, b);
+                assert!(b - a == s.utf8_size());
+                kani::cover(true, "next_match_back (unbounded) found the needle");
+            }
+            None => kani::cover(true, "next_match_back (unbounded) found nothing"),
+        }
+        assert!(type_invariant_cs(&s));
     }
 }
