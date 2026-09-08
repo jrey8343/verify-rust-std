@@ -1022,13 +1022,20 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// `initialized.start` ≤ `initialized.end` ≤ `capacity`.
     #[inline]
     #[cfg(not(test))]
+    ///
+    /// In addition, `initialized.start` must be a valid `head`, i.e. `initialized.start <
+    /// capacity` unless the range is `0..0`: the resulting deque uses `head` unwrapped (e.g.
+    /// `pop_front` reads slot `head` directly), so `head == capacity` reads past the buffer.
+    /// (`vec::IntoIter::into_vecdeque` currently violates this for an exhausted iterator whose
+    /// `Vec` had `capacity == len`; see rust-lang/rust#162452.)
     #[requires(initialized.start <= initialized.end && initialized.end <= capacity)]
+    #[requires(initialized.start < capacity || initialized.start == 0)]
     #[requires(Layout::array::<T>(capacity).is_ok())]
     #[requires(T::IS_ZST || capacity == 0
         || core::ub_checks::can_write(ptr::slice_from_raw_parts_mut(ptr, capacity)))]
     #[ensures(|result| result.head == old(initialized.start)
         && result.len == old(initialized.end) - old(initialized.start)
-        && result.len <= result.capacity()
+        && result.invariant_holds()
         && (T::IS_ZST || result.capacity() == capacity))]
     pub(crate) unsafe fn from_contiguous_raw_parts_in(
         ptr: *mut T,
@@ -4431,18 +4438,16 @@ mod verify {
         let deque =
             unsafe { VecDeque::from_contiguous_raw_parts_in(ptr, start..end, capacity, alloc) };
         assert_eq!(deque.len(), end - start);
-        let i: usize = kani::any();
-        if let Some(elem) = deque.get(i) {
-            let _ = unsafe { ptr::read(elem) };
-        }
-        // Note: an exhausted `vec::IntoIter` hands over `initialized == capacity..capacity`, so
-        // `head == capacity` (with `len == 0`) is a state this constructor legitimately
-        // produces even though the field comments describe `head < capacity`; `wrap_index`
-        // maps it onto `head == 0`.
+        // The `initialized.start < capacity || initialized.start == 0` precondition is what
+        // keeps `head` a valid physical index. Without it, `capacity..capacity` (which
+        // `vec::IntoIter::into_vecdeque` produces for an exhausted iterator whose `Vec` had
+        // `capacity == len`) yields `head == capacity`, and a subsequent `push_back` +
+        // `pop_front` reads one past the end of the buffer: rust-lang/rust#162452.
+        touch(&deque);
         kani::cover(end - start > 1 && start > 0, "from_contiguous_raw_parts_in: interior range");
         kani::cover(
-            start == capacity && capacity > 0,
-            "from_contiguous_raw_parts_in: head == capacity",
+            start == 0 && end == 0 && capacity > 0,
+            "from_contiguous_raw_parts_in: empty range",
         );
     }
 
