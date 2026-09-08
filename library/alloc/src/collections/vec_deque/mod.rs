@@ -21,6 +21,10 @@ use core::mem::{ManuallyDrop, SizedTypeProperties};
 use core::ops::{Index, IndexMut, Range, RangeBounds};
 use core::{fmt, ptr, slice};
 
+use safety::{ensures, requires};
+
+#[cfg(kani)]
+use crate::alloc::Layout;
 use crate::alloc::{Allocator, Global};
 use crate::collections::{TryReserveError, TryReserveErrorKind};
 use crate::raw_vec::RawVec;
@@ -170,12 +174,42 @@ impl<T, A: Allocator> VecDeque<T, A> {
         self.buf.ptr()
     }
 
+    /// Structural invariant of a `VecDeque` (see the field comments on the struct):
+    /// `len <= capacity()` and `head < capacity()` unless the capacity is zero, in which
+    /// case `head == 0`. Only used by the verification contracts below and by `mod verify`.
+    #[cfg(kani)]
+    fn invariant_holds(&self) -> bool {
+        self.len <= self.capacity()
+            && (self.head < self.capacity() || (self.capacity() == 0 && self.head == 0))
+    }
+
+    /// The physical slots `off..off + n` as a slice pointer, for `modifies` clauses. An empty
+    /// range is represented by a null slice so that a dangling or one-past-the-end base pointer
+    /// never has to be checked for writability. Only used by the verification contracts.
+    #[cfg(kani)]
+    fn slots(&self, off: usize, n: usize) -> *mut [T] {
+        if n == 0 || T::IS_ZST {
+            ptr::slice_from_raw_parts_mut(ptr::null_mut(), 0)
+        } else {
+            ptr::slice_from_raw_parts_mut(unsafe { self.ptr().add(off) }, n)
+        }
+    }
+
+    /// The whole physical buffer as a slice pointer, for `modifies` clauses.
+    #[cfg(kani)]
+    fn all_slots(&self) -> *mut [T] {
+        self.slots(0, self.capacity())
+    }
+
     /// Appends an element to the buffer.
     ///
     /// # Safety
     ///
     /// May only be called if `deque.len() < deque.capacity()`
     #[inline]
+    #[requires(self.invariant_holds() && self.len < self.capacity())]
+    #[ensures(|_| self.len == old(self.len) + 1 && self.invariant_holds())]
+    #[cfg_attr(kani, kani::modifies(&self.len, self.slots(self.to_physical_idx(self.len), 1)))]
     unsafe fn push_unchecked(&mut self, element: T) {
         // SAFETY: Because of the precondition, it's guaranteed that there is space
         // in the logical array after the last element.
@@ -200,7 +234,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
     }
 
     /// Moves an element out of the buffer
+    ///
+    /// # Safety
+    ///
+    /// `off < self.capacity()` and slot `off` must hold an initialized `T`. The value is moved
+    /// out: the caller must ensure the slot is no longer considered initialized afterwards.
     #[inline]
+    #[requires(off < self.capacity() && core::ub_checks::can_dereference(unsafe { self.ptr().add(off) }))]
     unsafe fn buffer_read(&mut self, off: usize) -> T {
         unsafe { ptr::read(self.ptr().add(off)) }
     }
@@ -210,6 +250,9 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// May only be called if `off < self.capacity()`.
     #[inline]
+    #[requires(off < self.capacity() && core::ub_checks::can_write(unsafe { self.ptr().add(off) }))]
+    #[ensures(|result| core::ptr::eq(*result, old(unsafe { self.ptr().add(off) })))]
+    #[cfg_attr(kani, kani::modifies(self.slots(off, 1)))]
     unsafe fn buffer_write(&mut self, off: usize, value: T) -> &mut T {
         unsafe {
             let ptr = self.ptr().add(off);
@@ -221,6 +264,9 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// Returns a slice pointer into the buffer.
     /// `range` must lie inside `0..self.capacity()`.
     #[inline]
+    #[requires(range.start <= range.end && range.end <= self.capacity())]
+    #[ensures(|result| result.len() == old(range.end) - old(range.start)
+        && core::ptr::eq(*result as *const T, unsafe { self.ptr().add(old(range.start)) }))]
     unsafe fn buffer_range(&self, range: Range<usize>) -> *mut [T] {
         unsafe {
             ptr::slice_from_raw_parts_mut(self.ptr().add(range.start), range.end - range.start)
@@ -325,7 +371,14 @@ impl<T, A: Allocator> VecDeque<T, A> {
     }
 
     /// Copies a contiguous block of memory len long from src to dst
+    ///
+    /// # Safety
+    ///
+    /// `src + len <= self.capacity()` and `dst + len <= self.capacity()`.
     #[inline]
+    #[requires(len <= self.capacity() && src <= self.capacity() - len && dst <= self.capacity() - len)]
+    #[ensures(|_| self.head == old(self.head) && self.len == old(self.len))]
+    #[cfg_attr(kani, kani::modifies(self.slots(dst, len)))]
     unsafe fn copy(&mut self, src: usize, dst: usize, len: usize) {
         debug_assert!(
             dst + len <= self.capacity(),
@@ -349,7 +402,16 @@ impl<T, A: Allocator> VecDeque<T, A> {
     }
 
     /// Copies a contiguous block of memory len long from src to dst
+    ///
+    /// # Safety
+    ///
+    /// `src + len <= self.capacity()`, `dst + len <= self.capacity()` and the two ranges
+    /// must not overlap: `src.abs_diff(dst) >= len`.
     #[inline]
+    #[requires(len <= self.capacity() && src <= self.capacity() - len && dst <= self.capacity() - len)]
+    #[requires(src.abs_diff(dst) >= len)]
+    #[ensures(|_| self.head == old(self.head) && self.len == old(self.len))]
+    #[cfg_attr(kani, kani::modifies(self.slots(dst, len)))]
     unsafe fn copy_nonoverlapping(&mut self, src: usize, dst: usize, len: usize) {
         debug_assert!(
             dst + len <= self.capacity(),
@@ -375,6 +437,19 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// Copies a potentially wrapping block of memory len long from src to dest.
     /// (abs(dst - src) + len) must be no larger than capacity() (There must be at
     /// most one continuous overlapping region between src and dest).
+    ///
+    /// # Safety
+    ///
+    /// `src` and `dst` must be physical indices (`< self.capacity()`, or both `0` when the
+    /// capacity is `0`) and `min(src.abs_diff(dst), self.capacity() - src.abs_diff(dst)) + len`
+    /// must not exceed `self.capacity()`.
+    #[requires(self.invariant_holds()
+        && ((src < self.capacity() && dst < self.capacity()) || (src == 0 && dst == 0))
+        && cmp::min(src.abs_diff(dst), self.capacity() - src.abs_diff(dst))
+            .checked_add(len)
+            .is_some_and(|end| end <= self.capacity()))]
+    #[ensures(|_| self.head == old(self.head) && self.len == old(self.len))]
+    #[cfg_attr(kani, kani::modifies(self.all_slots()))]
     unsafe fn wrap_copy(&mut self, src: usize, dst: usize, len: usize) {
         debug_assert!(
             cmp::min(src.abs_diff(dst), self.capacity() - src.abs_diff(dst)) + len
@@ -508,7 +583,14 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
     /// Copies all values from `src` to `dst`, wrapping around if needed.
     /// Assumes capacity is sufficient.
+    ///
+    /// # Safety
+    ///
+    /// `dst <= self.capacity()` and `src.len() <= self.capacity()`.
     #[inline]
+    #[requires(dst <= self.capacity() && src.len() <= self.capacity())]
+    #[ensures(|_| self.head == old(self.head) && self.len == old(self.len))]
+    #[cfg_attr(kani, kani::modifies(self.all_slots()))]
     unsafe fn copy_slice(&mut self, dst: usize, src: &[T]) {
         debug_assert!(src.len() <= self.capacity());
         let head_room = self.capacity() - dst;
@@ -560,17 +642,71 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// Assumes no wrapping around happens.
     /// Assumes capacity is sufficient.
+    ///
+    /// # Safety
+    ///
+    /// `iter` must yield at most `self.capacity() - dst` items. The contract below expresses
+    /// this through the iterator's upper `size_hint`, which is exact for the `TrustedLen`
+    /// iterators every caller passes.
     #[inline]
+    #[requires(iter.size_hint().1.is_some_and(|hi| {
+        dst.checked_add(hi).is_some_and(|end| end <= self.capacity())
+            && written.checked_add(hi).is_some()
+    }))]
+    #[ensures(|_| old(*written) <= *written
+        && *written - old(*written) <= old(iter.size_hint().1.unwrap_or(0)))]
+    #[cfg_attr(kani, kani::modifies(written, self.slots(dst, iter.size_hint().1.unwrap_or(0))))]
     unsafe fn write_iter(
         &mut self,
         dst: usize,
         iter: impl Iterator<Item = T>,
         written: &mut usize,
     ) {
+        #[cfg(not(kani))]
         iter.enumerate().for_each(|(i, element)| unsafe {
             self.buffer_write(dst + i, element);
             *written += 1;
         });
+        // Under Kani the very same iteration is spelled as an explicit loop (see
+        // `write_iter_loop`) so that a loop contract can be attached; loop contracts cannot be
+        // attached to the closure-driven `for_each`.
+        #[cfg(kani)]
+        unsafe {
+            self.write_iter_loop(dst, iter, written)
+        }
+    }
+
+    /// The loop of [`Self::write_iter`] in the form Kani's loop contracts accept: every element
+    /// yielded by `iter` is written to `dst + i` and counted, exactly as `for_each` does above;
+    /// nothing is skipped, synthesized or forgotten. It is verified as part of `write_iter`'s
+    /// contract proof (`check_write_iter_*` in `mod verify`). Callers of `write_iter` are
+    /// verified with this helper replaced by its contract (`stub_write_iter_loop`), because a
+    /// loop contract cannot survive the havocking of the reference-carrying
+    /// `Take<ByRefSized<&mut I>>` adapter that `write_iter_wrapping` passes.
+    #[cfg(kani)]
+    #[inline]
+    unsafe fn write_iter_loop(
+        &mut self,
+        dst: usize,
+        iter: impl Iterator<Item = T>,
+        written: &mut usize,
+    ) {
+        let bound = iter.size_hint().1.unwrap_or(0);
+        let written_on_entry = *written;
+        let mut iter = iter;
+        let mut i = 0;
+        #[safety::loop_invariant(i <= bound
+            && *written == written_on_entry + i
+            && iter.size_hint().1 == Some(bound - i))]
+        #[kani::loop_modifies(&raw mut *written, &i, &iter, self.slots(dst, bound))]
+        loop {
+            let Some(element) = iter.next() else { break };
+            unsafe {
+                self.buffer_write(dst + i, element);
+            }
+            *written += 1;
+            i += 1;
+        }
     }
 
     /// Writes all values from `iter` to `dst`, wrapping
@@ -581,6 +717,19 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// Assumes that `iter` yields at most `len` items.
     /// Assumes capacity is sufficient.
+    ///
+    /// # Safety
+    ///
+    /// `dst <= self.capacity()`, `self.len + len <= self.capacity()` and `iter` yields at most
+    /// `len` items (expressed through its upper `size_hint`, exact for `TrustedLen` callers).
+    #[requires(self.invariant_holds() && dst <= self.capacity() && len <= self.capacity() - self.len)]
+    #[requires(iter.size_hint().1.is_some_and(|hi| hi <= len))]
+    #[ensures(|written| *written <= len && self.len == old(self.len) + *written && self.invariant_holds())]
+    #[cfg_attr(kani, kani::modifies(
+        &self.len,
+        self.slots(dst, cmp::min(len, self.capacity() - dst)),
+        self.slots(0, len.saturating_sub(self.capacity() - dst))
+    ))]
     unsafe fn write_iter_wrapping(
         &mut self,
         dst: usize,
@@ -620,7 +769,17 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
     /// Frobs the head and tail sections around to handle the fact that we
     /// just reallocated. Unsafe because it trusts old_capacity.
+    ///
+    /// # Safety
+    ///
+    /// `old_capacity` must be the capacity the elements were laid out for before the
+    /// reallocation: `self.len <= old_capacity <= self.capacity()` and `self.head` must be a
+    /// valid physical index for it (`self.head < old_capacity`, or `0` if it was `0`).
     #[inline]
+    #[requires(self.len <= old_capacity && old_capacity <= self.capacity())]
+    #[requires(self.head < old_capacity || self.head == 0)]
+    #[ensures(|_| self.len == old(self.len) && self.invariant_holds())]
+    #[cfg_attr(kani, kani::modifies(&self.head, self.all_slots()))]
     unsafe fn handle_capacity_increase(&mut self, old_capacity: usize) {
         let new_capacity = self.capacity();
         debug_assert!(new_capacity >= old_capacity);
@@ -863,6 +1022,14 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// `initialized.start` ≤ `initialized.end` ≤ `capacity`.
     #[inline]
     #[cfg(not(test))]
+    #[requires(initialized.start <= initialized.end && initialized.end <= capacity)]
+    #[requires(Layout::array::<T>(capacity).is_ok())]
+    #[requires(T::IS_ZST || capacity == 0
+        || core::ub_checks::can_write(ptr::slice_from_raw_parts_mut(ptr, capacity)))]
+    #[ensures(|result| result.head == old(initialized.start)
+        && result.len == old(initialized.end) - old(initialized.start)
+        && result.len <= result.capacity()
+        && (T::IS_ZST || result.capacity() == capacity))]
     pub(crate) unsafe fn from_contiguous_raw_parts_in(
         ptr: *mut T,
         initialized: Range<usize>,
@@ -1304,6 +1471,19 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// `old_head` refers to the head index before `shrink_to` was called. `target_cap`
     /// is the capacity that it was trying to shrink to.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called in the state `shrink_to` leaves behind when `buf.shrink_to_fit`
+    /// unwinds: `self.len <= target_cap <= self.capacity()`, `self.head <= target_cap`,
+    /// `old_head < self.capacity()`, and either the elements are contiguous within
+    /// `target_cap` or the head slice `self.head..target_cap` fits back at `old_head`.
+    #[requires(self.invariant_holds() && self.len <= target_cap && target_cap <= self.capacity())]
+    #[requires(self.head <= target_cap && old_head < self.capacity())]
+    #[requires(self.head <= target_cap - self.len
+        || old_head.checked_add(target_cap - self.head).is_some_and(|end| end <= self.capacity()))]
+    #[ensures(|_| self.len == old(self.len) && self.invariant_holds())]
+    #[cfg_attr(kani, kani::modifies(&self.head, self.all_slots()))]
     unsafe fn abort_shrink(&mut self, old_head: usize, target_cap: usize) {
         // Moral equivalent of self.head + self.len <= target_cap. Won't overflow
         // because `self.len <= target_cap`.
@@ -2631,6 +2811,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
         let mut cur = 0;
 
         // Stage 1: All values are retained.
+        #[safety::loop_invariant(cur <= len && idx <= cur)]
+        #[cfg_attr(kani, kani::loop_modifies(&cur, &idx, self.all_slots()))]
         while cur < len {
             if !f(&mut self[cur]) {
                 cur += 1;
@@ -2640,6 +2822,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
             idx += 1;
         }
         // Stage 2: Swap retained value into current idx.
+        #[safety::loop_invariant(cur <= len && idx <= cur)]
+        #[cfg_attr(kani, kani::loop_modifies(&cur, &idx, self.all_slots()))]
         while cur < len {
             if !f(&mut self[cur]) {
                 cur += 1;
@@ -2984,6 +3168,9 @@ impl<T, A: Allocator> VecDeque<T, A> {
     // so it's sound to call here because we're calling with something
     // less than half the length, which is never above half the capacity.
 
+    #[requires(self.invariant_holds() && mid <= self.len / 2)]
+    #[ensures(|_| self.len == old(self.len) && self.invariant_holds())]
+    #[cfg_attr(kani, kani::modifies(&self.head, self.all_slots()))]
     unsafe fn rotate_left_inner(&mut self, mid: usize) {
         debug_assert!(mid * 2 <= self.len());
         unsafe {
@@ -2992,6 +3179,9 @@ impl<T, A: Allocator> VecDeque<T, A> {
         self.head = self.to_physical_idx(mid);
     }
 
+    #[requires(self.invariant_holds() && k <= self.len / 2)]
+    #[ensures(|_| self.len == old(self.len) && self.invariant_holds())]
+    #[cfg_attr(kani, kani::modifies(&self.head, self.all_slots()))]
     unsafe fn rotate_right_inner(&mut self, k: usize) {
         debug_assert!(k * 2 <= self.len());
         self.head = self.wrap_sub(self.head, k);
@@ -3768,9 +3958,1144 @@ impl<T, const N: usize> From<[T; N]> for VecDeque<T> {
 #[cfg(kani)]
 #[unstable(feature = "kani", issue = "none")]
 mod verify {
-    use core::kani;
+    use core::iter::TrustedLen;
+    use core::marker::PhantomData;
+    use core::mem::SizedTypeProperties;
+    use core::{cmp, kani, ptr};
 
+    use crate::alloc::Layout;
     use crate::collections::VecDeque;
+    use crate::vec::Vec;
+
+    /// A non-vacuity witness for a path through the ring buffer. Zero-sized element types never
+    /// touch the buffer (every such path is excluded by `T::IS_ZST` checks in the code), so the
+    /// witness is only meaningful, and only required, for sized `T`. (A macro rather than a
+    /// function because Kani needs the message to be a literal at the `cover` call site.)
+    macro_rules! cover_buffer_path {
+        ($t:ty, $cond:expr, $msg:literal) => {
+            kani::cover(<$t>::IS_ZST || $cond, $msg)
+        };
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Symbolic deque generator
+    // ---------------------------------------------------------------------------------------
+
+    /// Upper bound, in bytes, on the size of the backing allocation. This is not a bound of
+    /// the proof: it mirrors CBMC's memory model, whose objects are addressed with
+    /// `64 - object_bits` offset bits (`--object-bits 12` in `scripts/run-kani.sh`), so a single
+    /// allocation cannot exceed 2^51 bytes in the model. Every `cap` whose allocation fits the
+    /// model is explored; the bound only excludes allocations no real machine could back either.
+    const MAX_ALLOCATION_BYTES: usize = 1 << 48;
+
+    /// Builds an arbitrary `VecDeque<T>` with symbolic capacity, symbolic `head` and symbolic
+    /// `len`, backed by a real allocation of that capacity.
+    ///
+    /// * `cap` is only restricted by the layout precondition `RawVec` itself imposes
+    ///   (`Layout::array::<T>(cap).is_ok()`); there is no length bound.
+    /// * `head` ranges over every valid physical index and `len` over `0..=cap`, so both the
+    ///   contiguous (`head + len <= cap`) and the wrapped (`head + len > cap`) ring layouts are
+    ///   explored (see the `kani::cover` witnesses).
+    /// * Exactly the logical range `head..head + len` (wrapping at `cap`) is initialized, with an
+    ///   arbitrary byte pattern; slots outside it stay uninitialized. The element types used by
+    ///   the harnesses have no validity invariant, so any byte pattern is a valid `T`, and no
+    ///   proof depends on the element values.
+    pub(super) fn any_deque<T>() -> VecDeque<T> {
+        let requested: usize = kani::any();
+        kani::assume(Layout::array::<T>(requested).is_ok());
+        kani::assume(
+            requested
+                .checked_mul(core::mem::size_of::<T>())
+                .is_some_and(|b| b <= MAX_ALLOCATION_BYTES),
+        );
+        let mut deque = VecDeque::<T>::with_capacity(requested);
+        let cap = deque.capacity();
+        let head: usize = if cap == 0 { 0 } else { kani::any_where(|h: &usize| *h < cap) };
+        let len: usize = kani::any_where(|l: &usize| *l <= cap);
+        if !T::IS_ZST && len > 0 {
+            let fill: u8 = kani::any();
+            let head_room = cap - head;
+            unsafe {
+                if len <= head_room {
+                    ptr::write_bytes(deque.ptr().add(head), fill, len);
+                } else {
+                    ptr::write_bytes(deque.ptr().add(head), fill, head_room);
+                    ptr::write_bytes(deque.ptr(), fill, len - head_room);
+                }
+            }
+        }
+        deque.head = head;
+        deque.len = len;
+        kani::cover(len > cap - head, "generator: wrapped ring layout is reachable");
+        kani::cover(len > 0 && len <= cap - head, "generator: contiguous layout is reachable");
+        kani::cover(len == cap && cap > 1, "generator: full deque is reachable");
+        cover_buffer_path!(T, cap == 0, "generator: zero-capacity deque is reachable");
+        deque
+    }
+
+    /// Reads a symbolic logical index of `deque` so that the slot is actually dereferenced
+    /// after the operation under test.
+    pub(super) fn touch<T>(deque: &VecDeque<T>) {
+        let i: usize = kani::any();
+        if let Some(elem) = deque.get(i) {
+            let _ = unsafe { ptr::read(elem) };
+        }
+        assert!(deque.invariant_holds());
+    }
+
+    /// A harness iterator yielding exactly `remaining` arbitrary elements. It carries no
+    /// references, so loop-contract havocking cannot invalidate it, and its `size_hint` is
+    /// exact (it is `TrustedLen`, like every iterator the real callers of `write_iter` pass).
+    pub(super) struct AnyIter<T> {
+        remaining: usize,
+        _marker: PhantomData<T>,
+    }
+
+    impl<T> AnyIter<T> {
+        pub(super) fn new(remaining: usize) -> Self {
+            AnyIter { remaining, _marker: PhantomData }
+        }
+    }
+
+    impl<T: kani::Arbitrary> Iterator for AnyIter<T> {
+        type Item = T;
+
+        fn next(&mut self) -> Option<T> {
+            if self.remaining == 0 {
+                None
+            } else {
+                self.remaining -= 1;
+                Some(kani::any())
+            }
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (self.remaining, Some(self.remaining))
+        }
+
+        fn advance_by(&mut self, n: usize) -> Result<(), core::num::NonZero<usize>> {
+            let skipped = cmp::min(n, self.remaining);
+            self.remaining -= skipped;
+            core::num::NonZero::new(n - skipped).map_or(Ok(()), Err)
+        }
+    }
+
+    impl<T: kani::Arbitrary> ExactSizeIterator for AnyIter<T> {}
+    unsafe impl<T: kani::Arbitrary> TrustedLen for AnyIter<T> {}
+
+    // ---------------------------------------------------------------------------------------
+    // Contract harnesses (`proof_for_contract`) for the unsafe functions
+    // ---------------------------------------------------------------------------------------
+
+    /// Contract replacement for the loop of `VecDeque::write_iter` (`write_iter_loop`), used
+    /// when verifying the callers of `write_iter` (`write_iter_wrapping`, `resize_with`).
+    /// `write_iter` itself, loop included, is verified against its real body by
+    /// `check_write_iter_*`.
+    ///
+    /// This is what `#[kani::stub_verified(write_iter)]` would generate. It is written by hand
+    /// because the pinned Kani (a) cannot generate the replacement of a contract whose
+    /// `modifies` clause names a slice (kani-compiler `transform/contracts.rs` resolves
+    /// `write_any_slice` with the slice type itself as the element type and ICEs in
+    /// `reachability.rs`), and (b) cannot `kani::stub` a function that carries a contract
+    /// (model-checking/kani#4591); hence the contract-free helper is the stub target.
+    ///
+    /// It *asserts* the precondition of `write_iter`'s contract (so a caller violating it fails
+    /// its proof), then models every behaviour the contract permits: the iterator yields some
+    /// `n <= hi` elements, exactly the slots `dst..dst + n` receive arbitrary values, and
+    /// `*written` grows by `n`. The iterator is dropped rather than driven, so no loop is needed.
+    unsafe fn stub_write_iter_loop<T, A: crate::alloc::Allocator>(
+        deque: &mut VecDeque<T, A>,
+        dst: usize,
+        mut iter: impl Iterator<Item = T>,
+        written: &mut usize,
+    ) {
+        let n = unsafe { model_write_iter(deque, dst, &iter, written) };
+        // Consume the elements from the iterator exactly as the real loop does, so that an
+        // iterator shared with a later call (`write_iter_wrapping`'s wrapping branch borrows
+        // `iter` for the first call and passes it on to the second) reports the right
+        // remaining length. `advance_by` is O(1) for the harness iterator and the `Take` /
+        // `ByRefSized` adapters the callee wraps it in.
+        assert!(iter.advance_by(n).is_ok());
+    }
+
+    /// Like [`stub_write_iter_loop`] but drops the iterator instead of advancing it. Only valid
+    /// where the iterator is not observed after the call, i.e. in the non-wrapping branch of
+    /// `write_iter_wrapping` (used by the `resize_with` harnesses, whose `Take<RepeatWith<_>>`
+    /// iterator cannot be advanced without a loop).
+    unsafe fn stub_write_iter_loop_drop<T, A: crate::alloc::Allocator>(
+        deque: &mut VecDeque<T, A>,
+        dst: usize,
+        iter: impl Iterator<Item = T>,
+        written: &mut usize,
+    ) {
+        let _ = unsafe { model_write_iter(deque, dst, &iter, written) };
+        drop(iter);
+    }
+
+    /// Shared model of one `write_iter` call: checks the contract's precondition, requires the
+    /// exact size hint every `TrustedLen` caller guarantees, havocs exactly the slots that
+    /// receive elements and advances `*written`. Returns the number of elements written.
+    unsafe fn model_write_iter<T, A: crate::alloc::Allocator>(
+        deque: &mut VecDeque<T, A>,
+        dst: usize,
+        iter: &impl Iterator<Item = T>,
+        written: &mut usize,
+    ) -> usize {
+        let (lo, hi) = iter.size_hint();
+        let hi = hi.expect("write_iter: iterator must have an upper size bound");
+        assert!(lo == hi, "write_iter callers pass TrustedLen iterators");
+        assert!(dst.checked_add(hi).is_some_and(|end| end <= deque.capacity()));
+        assert!(written.checked_add(hi).is_some());
+        if !T::IS_ZST && hi > 0 {
+            unsafe { ptr::write_bytes(deque.ptr().add(dst), kani::any::<u8>(), hi) };
+        }
+        *written += hi;
+        hi
+    }
+
+    fn check_write_iter<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let dst: usize = kani::any();
+        let n: usize = kani::any();
+        let mut written: usize = kani::any();
+        let before = written;
+        unsafe { deque.write_iter(dst, AnyIter::<T>::new(n), &mut written) };
+        assert_eq!(written, before + n);
+        kani::cover(n > 1, "write_iter: more than one element written");
+        kani::cover(dst > 0 && n > 0, "write_iter: non-zero destination");
+    }
+
+    fn check_write_iter_wrapping<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let dst: usize = kani::any();
+        let len: usize = kani::any();
+        let n: usize = kani::any();
+        let old_len = deque.len;
+        let written = unsafe { deque.write_iter_wrapping(dst, AnyIter::<T>::new(n), len) };
+        assert!(written <= len);
+        assert_eq!(deque.len, old_len + written);
+        kani::cover(len > deque.capacity() - dst, "write_iter_wrapping: wrapping branch");
+        kani::cover(n > 0 && len <= deque.capacity() - dst, "write_iter_wrapping: direct branch");
+        touch(&deque);
+    }
+
+    fn check_copy<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let src: usize = kani::any();
+        let dst: usize = kani::any();
+        let len: usize = kani::any();
+        unsafe { deque.copy(src, dst, len) };
+        kani::cover(len > 1 && src.abs_diff(dst) < len, "copy: overlapping ranges");
+        kani::cover(len > 1 && src.abs_diff(dst) >= len, "copy: disjoint ranges");
+        touch(&deque);
+    }
+
+    fn check_copy_nonoverlapping<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let src: usize = kani::any();
+        let dst: usize = kani::any();
+        let len: usize = kani::any();
+        unsafe { deque.copy_nonoverlapping(src, dst, len) };
+        kani::cover(len > 1, "copy_nonoverlapping: more than one element");
+        touch(&deque);
+    }
+
+    fn check_wrap_copy<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let src: usize = kani::any();
+        let dst: usize = kani::any();
+        let len: usize = kani::any();
+        let cap = deque.capacity();
+        unsafe { deque.wrap_copy(src, dst, len) };
+        let copying = !T::IS_ZST && cap > 0 && len > 0 && src != dst;
+        let dst_after_src = copying && deque.wrap_sub(dst, src) < len;
+        let src_wraps = copying && cap - src < len;
+        let dst_wraps = copying && cap - dst < len;
+        cover_buffer_path!(T, copying && !src_wraps && !dst_wraps, "wrap_copy: (_, false, false)");
+        cover_buffer_path!(
+            T,
+            !dst_after_src && !src_wraps && dst_wraps,
+            "wrap_copy: (false, false, true)"
+        );
+        cover_buffer_path!(
+            T,
+            dst_after_src && !src_wraps && dst_wraps,
+            "wrap_copy: (true, false, true)"
+        );
+        cover_buffer_path!(
+            T,
+            !dst_after_src && src_wraps && !dst_wraps,
+            "wrap_copy: (false, true, false)"
+        );
+        cover_buffer_path!(
+            T,
+            dst_after_src && src_wraps && !dst_wraps,
+            "wrap_copy: (true, true, false)"
+        );
+        cover_buffer_path!(
+            T,
+            !dst_after_src && src_wraps && dst_wraps,
+            "wrap_copy: (false, true, true)"
+        );
+        cover_buffer_path!(
+            T,
+            dst_after_src && src_wraps && dst_wraps,
+            "wrap_copy: (true, true, true)"
+        );
+        touch(&deque);
+    }
+
+    fn check_buffer_read<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let off: usize = kani::any();
+        let value = unsafe { deque.buffer_read(off) };
+        core::mem::forget(value);
+        kani::cover(off > 0, "buffer_read: non-zero offset");
+    }
+
+    fn check_buffer_write<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let off: usize = kani::any();
+        let slot = unsafe { deque.buffer_write(off, kani::any()) };
+        let _ = unsafe { ptr::read(slot) };
+        kani::cover(off > 0, "buffer_write: non-zero offset");
+    }
+
+    fn check_push_unchecked<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let old_len = deque.len;
+        unsafe { deque.push_unchecked(kani::any()) };
+        assert_eq!(deque.len, old_len + 1);
+        kani::cover(old_len >= deque.capacity() - deque.head, "push_unchecked: wrapped write");
+        touch(&deque);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Safe-abstraction harnesses (`kani::proof`)
+    // ---------------------------------------------------------------------------------------
+
+    /// Abstraction of the *safe* `core::slice::rotate::ptr_rotate` used by
+    /// `<[T]>::rotate_left/right`: it checks the callee's documented precondition (the range
+    /// `mid - left .. mid + right` must be valid for reading and writing) and otherwise leaves
+    /// memory untouched. `make_contiguous` performs no value-dependent operation after the
+    /// rotation, and a rotation of a valid slice can only permute valid values, so this
+    /// abstraction is sound for the memory-safety proof of `make_contiguous`.
+    unsafe fn stub_ptr_rotate<T>(left: usize, mid: *mut T, right: usize) {
+        let len = left.checked_add(right).expect("rotate range overflows");
+        let start = unsafe { mid.sub(left) };
+        assert!(core::ub_checks::can_write(ptr::slice_from_raw_parts_mut(start, len)));
+    }
+
+    fn check_make_contiguous<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len;
+        let cap = deque.capacity();
+        let head = deque.head;
+        let wrapped = !T::IS_ZST && len > cap - head;
+        let free = cap - len;
+        let slice = deque.make_contiguous();
+        assert_eq!(slice.len(), len);
+        if len > 0 {
+            let _ = unsafe { ptr::read(&slice[len - 1]) };
+        }
+        assert!(deque.is_contiguous());
+        let head_len = cap - head;
+        let tail_len = len.wrapping_sub(head_len);
+        cover_buffer_path!(
+            T,
+            wrapped && free >= head_len,
+            "make_contiguous: head fits in free space"
+        );
+        cover_buffer_path!(
+            T,
+            wrapped && free < head_len && free >= tail_len,
+            "make_contiguous: tail fits"
+        );
+        cover_buffer_path!(
+            T,
+            wrapped && free < head_len && free < tail_len && head_len > tail_len,
+            "make_contiguous: rotate_left"
+        );
+        cover_buffer_path!(
+            T,
+            wrapped && free < head_len && free < tail_len && head_len <= tail_len,
+            "make_contiguous: rotate_right"
+        );
+        touch(&deque);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Remaining contract harnesses
+    // ---------------------------------------------------------------------------------------
+
+    /// Allocates a deque with symbolic capacity and no elements (`head == len == 0`).
+    pub(super) fn any_empty_deque<T>() -> VecDeque<T> {
+        let requested: usize = kani::any();
+        kani::assume(Layout::array::<T>(requested).is_ok());
+        kani::assume(
+            requested
+                .checked_mul(core::mem::size_of::<T>())
+                .is_some_and(|b| b <= MAX_ALLOCATION_BYTES),
+        );
+        VecDeque::<T>::with_capacity(requested)
+    }
+
+    /// Lays out a logical ring of `len` elements starting at `head` inside the first `ring_cap`
+    /// slots of `deque`'s buffer (`ring_cap <= deque.capacity()`, `head < ring_cap` unless
+    /// `ring_cap == 0`, `len <= ring_cap`): initializes exactly those slots and sets the fields.
+    pub(super) fn init_ring<T>(deque: &mut VecDeque<T>, ring_cap: usize, head: usize, len: usize) {
+        assert!(ring_cap <= deque.capacity() && len <= ring_cap);
+        assert!(head < ring_cap || (ring_cap == 0 && head == 0));
+        if !T::IS_ZST && len > 0 {
+            let fill: u8 = kani::any();
+            let head_room = ring_cap - head;
+            unsafe {
+                if len <= head_room {
+                    ptr::write_bytes(deque.ptr().add(head), fill, len);
+                } else {
+                    ptr::write_bytes(deque.ptr().add(head), fill, head_room);
+                    ptr::write_bytes(deque.ptr(), fill, len - head_room);
+                }
+            }
+        }
+        deque.head = head;
+        deque.len = len;
+    }
+
+    /// A `Vec<T>` of symbolic length whose elements are all initialized.
+    pub(super) fn any_vec<T>() -> Vec<T> {
+        let len: usize = kani::any();
+        kani::assume(Layout::array::<T>(len).is_ok());
+        kani::assume(
+            len.checked_mul(core::mem::size_of::<T>()).is_some_and(|b| b <= MAX_ALLOCATION_BYTES),
+        );
+        let mut vec = Vec::<T>::with_capacity(len);
+        if !T::IS_ZST && len > 0 {
+            unsafe { ptr::write_bytes(vec.as_mut_ptr(), kani::any::<u8>(), len) };
+        }
+        unsafe { vec.set_len(len) };
+        vec
+    }
+
+    fn check_buffer_range<T: kani::Arbitrary>() {
+        let deque = any_deque::<T>();
+        let start: usize = kani::any();
+        let end: usize = kani::any();
+        let slice = unsafe { deque.buffer_range(start..end) };
+        assert_eq!(slice.len(), end - start);
+        assert!(core::ptr::eq(slice as *const T, unsafe { deque.ptr().add(start) }));
+        kani::cover(end - start > 1, "buffer_range: more than one slot");
+        // `Drop for VecDeque` calls `buffer_range` too; a contract harness must contain a single
+        // call to the function under contract, so the (element-free) deque is leaked instead.
+        core::mem::forget(deque);
+    }
+
+    fn check_copy_slice<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let src = any_vec::<T>();
+        let dst: usize = kani::any();
+        unsafe { deque.copy_slice(dst, &src) };
+        kani::cover(src.len() > 0 && src.len() <= deque.capacity() - dst, "copy_slice: no wrap");
+        kani::cover(src.len() > deque.capacity() - dst, "copy_slice: wrapping copy");
+        touch(&deque);
+    }
+
+    fn check_handle_capacity_increase<T: kani::Arbitrary>() {
+        let mut deque = any_empty_deque::<T>();
+        let new_cap = deque.capacity();
+        let old_cap: usize = kani::any_where(|c: &usize| *c <= new_cap);
+        let head: usize = if old_cap == 0 { 0 } else { kani::any_where(|h: &usize| *h < old_cap) };
+        let len: usize = kani::any_where(|l: &usize| *l <= old_cap);
+        init_ring(&mut deque, old_cap, head, len);
+        let contiguous = head <= old_cap - len;
+        let head_len = old_cap - head;
+        let case_b =
+            !contiguous && head_len > len - head_len && new_cap - old_cap >= len - head_len;
+        unsafe { deque.handle_capacity_increase(old_cap) };
+        assert!(deque.is_contiguous() || T::IS_ZST || len > old_cap - head);
+        kani::cover(contiguous && len > 0, "handle_capacity_increase: case A (no move)");
+        kani::cover(case_b, "handle_capacity_increase: case B (tail moved)");
+        kani::cover(!contiguous && !case_b, "handle_capacity_increase: case C (head moved)");
+        kani::cover(old_cap == 0, "handle_capacity_increase: from zero capacity");
+        touch(&deque);
+    }
+
+    fn check_from_contiguous_raw_parts_in<T: kani::Arbitrary>() {
+        let vec = any_empty_deque_vec::<T>();
+        let (ptr, _, capacity, alloc) = vec.into_raw_parts_with_alloc();
+        let start: usize = kani::any();
+        let end: usize = kani::any();
+        if !T::IS_ZST && start <= end && end <= capacity && end > start {
+            unsafe { ptr::write_bytes(ptr.add(start), kani::any::<u8>(), end - start) };
+        }
+        let deque =
+            unsafe { VecDeque::from_contiguous_raw_parts_in(ptr, start..end, capacity, alloc) };
+        assert_eq!(deque.len(), end - start);
+        let i: usize = kani::any();
+        if let Some(elem) = deque.get(i) {
+            let _ = unsafe { ptr::read(elem) };
+        }
+        // Note: an exhausted `vec::IntoIter` hands over `initialized == capacity..capacity`, so
+        // `head == capacity` (with `len == 0`) is a state this constructor legitimately
+        // produces even though the field comments describe `head < capacity`; `wrap_index`
+        // maps it onto `head == 0`.
+        kani::cover(end - start > 1 && start > 0, "from_contiguous_raw_parts_in: interior range");
+        kani::cover(
+            start == capacity && capacity > 0,
+            "from_contiguous_raw_parts_in: head == capacity",
+        );
+    }
+
+    /// A `Vec<T>` with symbolic capacity and no elements, used to obtain raw parts.
+    fn any_empty_deque_vec<T>() -> Vec<T> {
+        let requested: usize = kani::any();
+        kani::assume(Layout::array::<T>(requested).is_ok());
+        kani::assume(
+            requested
+                .checked_mul(core::mem::size_of::<T>())
+                .is_some_and(|b| b <= MAX_ALLOCATION_BYTES),
+        );
+        Vec::<T>::with_capacity(requested)
+    }
+
+    fn check_abort_shrink<T: kani::Arbitrary>() {
+        let mut deque = any_empty_deque::<T>();
+        let cap = deque.capacity();
+        let target_cap: usize = kani::any_where(|c: &usize| *c <= cap);
+        let len: usize = kani::any_where(|l: &usize| *l <= target_cap);
+        let head: usize = kani::any_where(|h: &usize| *h <= target_cap);
+        let old_head: usize = kani::any_where(|h: &usize| *h < cap);
+        kani::assume(head < target_cap || len == 0);
+        if head < target_cap {
+            init_ring(&mut deque, target_cap, head, len);
+        } else {
+            deque.head = head;
+            deque.len = 0;
+        }
+        let contiguous = head <= target_cap - len;
+        let head_len = target_cap - head;
+        let tail_len = len.wrapping_sub(head_len);
+        let case_b = !contiguous && tail_len <= cmp::min(head_len, cap - target_cap);
+        unsafe { deque.abort_shrink(old_head, target_cap) };
+        kani::cover(contiguous && len > 0, "abort_shrink: contiguous, nothing to do");
+        kani::cover(case_b, "abort_shrink: tail copied to the back");
+        kani::cover(!contiguous && !case_b, "abort_shrink: head copied back to old_head");
+        touch(&deque);
+    }
+
+    fn check_rotate_left_inner<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let mid: usize = kani::any();
+        unsafe { deque.rotate_left_inner(mid) };
+        kani::cover(mid > 1, "rotate_left_inner: rotation by more than one");
+        touch(&deque);
+    }
+
+    fn check_rotate_right_inner<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let k: usize = kani::any();
+        unsafe { deque.rotate_right_inner(k) };
+        kani::cover(k > 1, "rotate_right_inner: rotation by more than one");
+        touch(&deque);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Safe-abstraction harnesses
+    // ---------------------------------------------------------------------------------------
+
+    /// `push_*`, `insert`, `reserve*` and `append` may legitimately panic with "capacity
+    /// overflow" when the requested capacity cannot be represented; the harnesses assume the
+    /// documented non-panicking condition instead (the new capacity fits the allocation model).
+    fn assume_can_grow_by<T>(deque: &VecDeque<T>, additional: usize) {
+        kani::assume(deque.len().checked_add(additional).is_some_and(|new_len| {
+            new_len
+                .checked_mul(core::mem::size_of::<T>())
+                .is_some_and(|b| b <= MAX_ALLOCATION_BYTES)
+                && (!T::IS_ZST || new_len < usize::MAX)
+        }));
+    }
+
+    fn check_get<T: kani::Arbitrary>() {
+        let deque = any_deque::<T>();
+        let i: usize = kani::any();
+        let elem = deque.get(i);
+        assert_eq!(elem.is_some(), i < deque.len());
+        if let Some(elem) = elem {
+            let _ = unsafe { ptr::read(elem) };
+        }
+        kani::cover(i > 0 && i < deque.len(), "get: in-bounds non-front index");
+        kani::cover(i >= deque.len(), "get: out-of-bounds index");
+    }
+
+    fn check_get_mut<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let i: usize = kani::any();
+        let len = deque.len();
+        let elem = deque.get_mut(i);
+        assert_eq!(elem.is_some(), i < len);
+        if let Some(elem) = elem {
+            *elem = kani::any();
+        }
+        kani::cover(i > 0 && i < len, "get_mut: in-bounds non-front index");
+        touch(&deque);
+    }
+
+    fn check_swap<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let i: usize = kani::any_where(|x: &usize| *x < len);
+        let j: usize = kani::any_where(|x: &usize| *x < len);
+        deque.swap(i, j);
+        kani::cover(i != j, "swap: distinct indices");
+        touch(&deque);
+    }
+
+    fn check_as_slices<T: kani::Arbitrary>() {
+        let deque = any_deque::<T>();
+        let (a, b) = deque.as_slices();
+        assert_eq!(a.len() + b.len(), deque.len());
+        if let Some(last) = a.last() {
+            let _ = unsafe { ptr::read(last) };
+        }
+        if let Some(last) = b.last() {
+            let _ = unsafe { ptr::read(last) };
+        }
+        kani::cover(!a.is_empty() && !b.is_empty(), "as_slices: both halves non-empty");
+    }
+
+    fn check_as_mut_slices<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let (a, b) = deque.as_mut_slices();
+        assert_eq!(a.len() + b.len(), len);
+        if let Some(last) = a.last_mut() {
+            *last = kani::any();
+        }
+        if let Some(first) = b.first_mut() {
+            *first = kani::any();
+        }
+        kani::cover(!a.is_empty() && !b.is_empty(), "as_mut_slices: both halves non-empty");
+        touch(&deque);
+    }
+
+    fn any_subrange(len: usize) -> (usize, usize) {
+        let start: usize = kani::any_where(|s: &usize| *s <= len);
+        let end: usize = kani::any_where(|e: &usize| *e >= start && *e <= len);
+        (start, end)
+    }
+
+    fn check_range<T: kani::Arbitrary>() {
+        let deque = any_deque::<T>();
+        let (start, end) = any_subrange(deque.len());
+        let mut iter = deque.range(start..end);
+        assert_eq!(iter.len(), end - start);
+        if let Some(first) = iter.next() {
+            let _ = unsafe { ptr::read(first) };
+        }
+        if let Some(last) = iter.next_back() {
+            let _ = unsafe { ptr::read(last) };
+        }
+        kani::cover(end - start > 2, "range: more than two elements");
+    }
+
+    fn check_range_mut<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let (start, end) = any_subrange(deque.len());
+        let mut iter = deque.range_mut(start..end);
+        assert_eq!(iter.len(), end - start);
+        if let Some(first) = iter.next() {
+            *first = kani::any();
+        }
+        if let Some(last) = iter.next_back() {
+            *last = kani::any();
+        }
+        kani::cover(end - start > 2, "range_mut: more than two elements");
+        touch(&deque);
+    }
+
+    fn check_drain<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let (start, end) = any_subrange(len);
+        let mut drain = deque.drain(start..end);
+        let pull_front: bool = kani::any();
+        let pull_back: bool = kani::any();
+        if pull_front {
+            if let Some(elem) = drain.next() {
+                core::mem::forget(elem);
+            }
+        }
+        if pull_back {
+            if let Some(elem) = drain.next_back() {
+                core::mem::forget(elem);
+            }
+        }
+        drop(drain);
+        assert_eq!(deque.len(), len - (end - start));
+        kani::cover(
+            start > 0 && end < len && end > start,
+            "drain: interior range (elements moved)",
+        );
+        kani::cover(start == 0 && end == len && len > 0, "drain: everything drained");
+        kani::cover(start > 0 && end == len && end > start, "drain: tail drained");
+        kani::cover(start == 0 && end < len && end > 0, "drain: head drained");
+        touch(&deque);
+    }
+
+    fn check_pop_front<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let elem = deque.pop_front();
+        assert_eq!(elem.is_some(), len > 0);
+        assert_eq!(deque.len(), len.saturating_sub(1));
+        core::mem::forget(elem);
+        kani::cover(len > 1, "pop_front: elements remain");
+        touch(&deque);
+    }
+
+    fn check_pop_back<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let elem = deque.pop_back();
+        assert_eq!(elem.is_some(), len > 0);
+        assert_eq!(deque.len(), len.saturating_sub(1));
+        core::mem::forget(elem);
+        kani::cover(len > 1, "pop_back: elements remain");
+        touch(&deque);
+    }
+
+    fn check_push_front<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let full = deque.is_full();
+        assume_can_grow_by(&deque, 1);
+        deque.push_front(kani::any());
+        assert_eq!(deque.len(), len + 1);
+        cover_buffer_path!(T, full && len > 0, "push_front: buffer grown");
+        kani::cover(!full && len > 0, "push_front: no growth");
+        touch(&deque);
+    }
+
+    fn check_push_back<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let full = deque.is_full();
+        assume_can_grow_by(&deque, 1);
+        deque.push_back(kani::any());
+        assert_eq!(deque.len(), len + 1);
+        cover_buffer_path!(T, full && len > 0, "push_back: buffer grown");
+        kani::cover(!full && len > 0, "push_back: no growth");
+        touch(&deque);
+    }
+
+    fn check_reserve<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let old_cap = deque.capacity();
+        let additional: usize = kani::any();
+        assume_can_grow_by(&deque, additional);
+        deque.reserve(additional);
+        assert_eq!(deque.len(), len);
+        assert!(deque.capacity() >= len + additional);
+        cover_buffer_path!(T, len + additional > old_cap && len > 0, "reserve: buffer grown");
+        kani::cover(len + additional <= old_cap, "reserve: no growth");
+        touch(&deque);
+    }
+
+    fn check_reserve_exact<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let old_cap = deque.capacity();
+        let additional: usize = kani::any();
+        assume_can_grow_by(&deque, additional);
+        deque.reserve_exact(additional);
+        assert_eq!(deque.len(), len);
+        assert!(deque.capacity() >= len + additional);
+        cover_buffer_path!(T, len + additional > old_cap && len > 0, "reserve_exact: buffer grown");
+        kani::cover(len + additional <= old_cap, "reserve_exact: no growth");
+        touch(&deque);
+    }
+
+    fn check_try_reserve<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let old_cap = deque.capacity();
+        let additional: usize = kani::any();
+        let result = deque.try_reserve(additional);
+        assert_eq!(deque.len(), len);
+        if result.is_ok() {
+            assert!(deque.capacity() >= len + additional);
+        }
+        cover_buffer_path!(
+            T,
+            result.is_ok() && len + additional > old_cap && len > 0,
+            "try_reserve: buffer grown"
+        );
+        kani::cover(result.is_err(), "try_reserve: capacity overflow reported");
+        touch(&deque);
+    }
+
+    fn check_try_reserve_exact<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let old_cap = deque.capacity();
+        let additional: usize = kani::any();
+        let result = deque.try_reserve_exact(additional);
+        assert_eq!(deque.len(), len);
+        if result.is_ok() {
+            assert!(deque.capacity() >= len + additional);
+        }
+        cover_buffer_path!(
+            T,
+            result.is_ok() && len + additional > old_cap && len > 0,
+            "try_reserve_exact: buffer grown"
+        );
+        kani::cover(result.is_err(), "try_reserve_exact: capacity overflow reported");
+        touch(&deque);
+    }
+
+    fn check_shrink_to<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let head = deque.head;
+        let cap = deque.capacity();
+        let min_capacity: usize = kani::any();
+        let target_cap = cmp::max(min_capacity, len);
+        let end = head as u128 + len as u128;
+        let tail_outside = target_cap < cap && end > target_cap as u128 && end <= cap as u128;
+        deque.shrink_to(min_capacity);
+        assert_eq!(deque.len(), len);
+        assert!(deque.capacity() >= cmp::min(target_cap, cap));
+        let shrinking = !T::IS_ZST && target_cap < cap && len > 0;
+        cover_buffer_path!(
+            T,
+            shrinking && head >= target_cap && tail_outside,
+            "shrink_to: all elements moved to front"
+        );
+        cover_buffer_path!(
+            T,
+            shrinking && head < target_cap && tail_outside,
+            "shrink_to: tail wrapped to front"
+        );
+        cover_buffer_path!(
+            T,
+            shrinking && !tail_outside && end > cap as u128,
+            "shrink_to: head slice moved back"
+        );
+        cover_buffer_path!(
+            T,
+            shrinking && !tail_outside && end <= target_cap as u128,
+            "shrink_to: elements untouched"
+        );
+        touch(&deque);
+    }
+
+    fn check_truncate<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let front_len = deque.as_slices().0.len();
+        let new_len: usize = kani::any();
+        deque.truncate(new_len);
+        assert_eq!(deque.len(), cmp::min(len, new_len));
+        kani::cover(new_len < len && new_len > front_len, "truncate: cut inside the back slice");
+        kani::cover(
+            new_len < len && new_len <= front_len && front_len < len,
+            "truncate: cut inside the front slice, back dropped",
+        );
+        kani::cover(new_len >= len, "truncate: no-op");
+        touch(&deque);
+    }
+
+    fn check_insert<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let full = deque.is_full();
+        let index: usize = kani::any_where(|i: &usize| *i <= len);
+        assume_can_grow_by(&deque, 1);
+        deque.insert(index, kani::any());
+        assert_eq!(deque.len(), len + 1);
+        kani::cover(len - index < index, "insert: back half shifted");
+        kani::cover(len - index >= index && index > 0, "insert: front half shifted");
+        cover_buffer_path!(T, full && len > 0, "insert: buffer grown");
+        touch(&deque);
+    }
+
+    fn check_remove<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let index: usize = kani::any();
+        let elem = deque.remove(index);
+        assert_eq!(elem.is_some(), index < len);
+        assert_eq!(deque.len(), if index < len { len - 1 } else { len });
+        core::mem::forget(elem);
+        kani::cover(index < len && len - index - 1 < index, "remove: back half shifted");
+        kani::cover(
+            index < len && len - index - 1 >= index && index > 0,
+            "remove: front half shifted",
+        );
+        touch(&deque);
+    }
+
+    fn check_split_off<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let first_len = deque.as_slices().0.len();
+        let at: usize = kani::any_where(|a: &usize| *a <= len);
+        let other = deque.split_off(at);
+        assert_eq!(deque.len(), at);
+        assert_eq!(other.len(), len - at);
+        kani::cover(at < first_len && first_len < len, "split_off: split inside the first half");
+        kani::cover(
+            at >= first_len && at < len && first_len < len,
+            "split_off: split inside the second half",
+        );
+        touch(&deque);
+        touch(&other);
+    }
+
+    fn check_append<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let mut other = any_deque::<T>();
+        let len = deque.len();
+        let other_len = other.len();
+        let old_cap = deque.capacity();
+        assume_can_grow_by(&deque, other_len);
+        deque.append(&mut other);
+        assert_eq!(deque.len(), len + other_len);
+        assert_eq!(other.len(), 0);
+        cover_buffer_path!(T, len + other_len > old_cap && other_len > 0, "append: buffer grown");
+        kani::cover(len + other_len <= old_cap && other_len > 0 && len > 0, "append: in place");
+        touch(&deque);
+        touch(&other);
+    }
+
+    fn check_retain_mut<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        deque.retain_mut(|elem| {
+            let keep: bool = kani::any();
+            if keep {
+                *elem = kani::any();
+            }
+            keep
+        });
+        assert!(deque.len() <= len);
+        kani::cover(deque.len() > 0 && deque.len() < len, "retain_mut: some elements removed");
+        touch(&deque);
+    }
+
+    fn check_grow<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        kani::assume(deque.is_full());
+        let len = deque.len();
+        assume_can_grow_by(&deque, 1);
+        deque.grow();
+        assert_eq!(deque.len(), len);
+        assert!(!deque.is_full());
+        kani::cover(len > 1, "grow: non-trivial deque");
+        touch(&deque);
+    }
+
+    /// `resize_with` appends through `extend` → `write_iter_wrapping` with a
+    /// `Take<RepeatWith<_>>` iterator. That iterator cannot be advanced without a loop, so the
+    /// contract replacement of `write_iter`'s loop can only model calls after which the
+    /// iterator is not reused, i.e. the non-wrapping branch of `write_iter_wrapping` (see
+    /// `stub_write_iter_loop_drop`). The two `resize_with` harnesses therefore restrict the
+    /// appended elements to not wrap around the end of the buffer, in two complementary ways;
+    /// the wrapping write path itself is verified by `check_write_iter_wrapping_*`.
+    ///
+    /// Variant 1: arbitrary (possibly wrapped) deque, capacity reserved up front so that the
+    /// appended elements fit behind the last element without wrapping.
+    fn check_resize_with<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let new_len: usize = kani::any();
+        if new_len > len {
+            let additional = new_len - len;
+            assume_can_grow_by(&deque, additional);
+            deque.reserve(additional);
+            kani::assume(additional <= deque.capacity() - deque.to_physical_idx(len));
+        }
+        deque.resize_with(new_len, || kani::any());
+        assert_eq!(deque.len(), new_len);
+        kani::cover(
+            new_len > len && new_len - len > 1 && len > 0 && deque.head > 0,
+            "resize_with: grown by more than one",
+        );
+        kani::cover(new_len < len, "resize_with: truncated");
+        touch(&deque);
+    }
+
+    /// Variant 2: contiguous deque starting at `head == 0`, so that the growth performed by
+    /// `resize_with` itself (`reserve` → `handle_capacity_increase`, case A) keeps the appended
+    /// elements from wrapping.
+    fn check_resize_with_grow<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        kani::assume(deque.head == 0);
+        let len = deque.len();
+        let cap = deque.capacity();
+        let new_len: usize = kani::any();
+        if new_len > len {
+            assume_can_grow_by(&deque, new_len - len);
+        }
+        deque.resize_with(new_len, || kani::any());
+        assert_eq!(deque.len(), new_len);
+        cover_buffer_path!(T, new_len > cap && len > 0, "resize_with: buffer grown");
+        kani::cover(
+            new_len > len && new_len - len > 1 && new_len <= cap,
+            "resize_with: appended in place",
+        );
+        touch(&deque);
+    }
+
+    fn check_rotate_left<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let n: usize = kani::any_where(|n: &usize| *n <= len);
+        deque.rotate_left(n);
+        assert_eq!(deque.len(), len);
+        kani::cover(n > 0 && n <= len - n, "rotate_left: via rotate_left_inner");
+        kani::cover(n > len - n, "rotate_left: via rotate_right_inner");
+        touch(&deque);
+    }
+
+    fn check_rotate_right<T: kani::Arbitrary>() {
+        let mut deque = any_deque::<T>();
+        let len = deque.len();
+        let n: usize = kani::any_where(|n: &usize| *n <= len);
+        deque.rotate_right(n);
+        assert_eq!(deque.len(), len);
+        kani::cover(n > 0 && n <= len - n, "rotate_right: via rotate_right_inner");
+        kani::cover(n > len - n, "rotate_right: via rotate_left_inner");
+        touch(&deque);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Instantiation over element types.
+    // ---------------------------------------------------------------------------------------
+
+    macro_rules! contract_harness {
+        ($target:ident, $harness:ident, $ty:ty, $name:ident, [$($attr:meta),*]) => {
+            #[kani::proof_for_contract(VecDeque::<$ty>::$target)]
+            $(#[$attr])*
+            fn $name() {
+                $harness::<$ty>();
+            }
+        };
+    }
+
+    macro_rules! contract_harnesses {
+        ($target:ident, $harness:ident, [$($ty:ty => $name:ident),* $(,)?]) => {
+            $( contract_harness!($target, $harness, $ty, $name, []); )*
+        };
+        ($target:ident, $harness:ident, $attrs:tt, [$($ty:ty => $name:ident),* $(,)?]) => {
+            $( contract_harness!($target, $harness, $ty, $name, $attrs); )*
+        };
+    }
+
+    macro_rules! proof_harness {
+        ($harness:ident, $ty:ty, $name:ident, [$($attr:meta),*]) => {
+            #[kani::proof]
+            $(#[$attr])*
+            fn $name() {
+                $harness::<$ty>();
+            }
+        };
+    }
+
+    macro_rules! proof_harnesses {
+        ($harness:ident, $attrs:tt, [$($ty:ty => $name:ident),* $(,)?]) => {
+            $( proof_harness!($harness, $ty, $name, $attrs); )*
+        };
+    }
+
+    contract_harnesses!(push_unchecked, check_push_unchecked, [u8 => check_push_unchecked_u8, u64 => check_push_unchecked_u64, [u8; 3] => check_push_unchecked_u8x3, () => check_push_unchecked_unit]);
+    contract_harnesses!(buffer_read, check_buffer_read, [u8 => check_buffer_read_u8, u64 => check_buffer_read_u64, [u8; 3] => check_buffer_read_u8x3, () => check_buffer_read_unit]);
+    contract_harnesses!(buffer_write, check_buffer_write, [u8 => check_buffer_write_u8, u64 => check_buffer_write_u64, [u8; 3] => check_buffer_write_u8x3, () => check_buffer_write_unit]);
+    contract_harnesses!(buffer_range, check_buffer_range, [u8 => check_buffer_range_u8, u64 => check_buffer_range_u64, [u8; 3] => check_buffer_range_u8x3, () => check_buffer_range_unit]);
+    contract_harnesses!(copy, check_copy, [u8 => check_copy_u8, u64 => check_copy_u64, [u8; 3] => check_copy_u8x3, () => check_copy_unit]);
+    contract_harnesses!(copy_nonoverlapping, check_copy_nonoverlapping, [u8 => check_copy_nonoverlapping_u8, u64 => check_copy_nonoverlapping_u64, [u8; 3] => check_copy_nonoverlapping_u8x3, () => check_copy_nonoverlapping_unit]);
+    contract_harnesses!(wrap_copy, check_wrap_copy, [u8 => check_wrap_copy_u8, u64 => check_wrap_copy_u64, () => check_wrap_copy_unit]);
+    contract_harnesses!(copy_slice, check_copy_slice, [u8 => check_copy_slice_u8, u64 => check_copy_slice_u64, () => check_copy_slice_unit]);
+    contract_harnesses!(write_iter, check_write_iter, [u8 => check_write_iter_u8, u64 => check_write_iter_u64, [u8; 3] => check_write_iter_u8x3, () => check_write_iter_unit]);
+    contract_harnesses!(
+        write_iter_wrapping,
+        check_write_iter_wrapping,
+        [kani::stub(VecDeque::<u8>::write_iter_loop, stub_write_iter_loop)],
+        [u8 => check_write_iter_wrapping_u8]
+    );
+    contract_harnesses!(
+        write_iter_wrapping,
+        check_write_iter_wrapping,
+        [kani::stub(VecDeque::<u64>::write_iter_loop, stub_write_iter_loop)],
+        [u64 => check_write_iter_wrapping_u64]
+    );
+    contract_harnesses!(
+        write_iter_wrapping,
+        check_write_iter_wrapping,
+        [kani::stub(VecDeque::<()>::write_iter_loop, stub_write_iter_loop)],
+        [() => check_write_iter_wrapping_unit]
+    );
+    contract_harnesses!(handle_capacity_increase, check_handle_capacity_increase, [u8 => check_handle_capacity_increase_u8, u64 => check_handle_capacity_increase_u64, () => check_handle_capacity_increase_unit]);
+    contract_harnesses!(from_contiguous_raw_parts_in, check_from_contiguous_raw_parts_in, [u8 => check_from_contiguous_raw_parts_in_u8, u64 => check_from_contiguous_raw_parts_in_u64, [u8; 3] => check_from_contiguous_raw_parts_in_u8x3, () => check_from_contiguous_raw_parts_in_unit]);
+    contract_harnesses!(abort_shrink, check_abort_shrink, [u8 => check_abort_shrink_u8, u64 => check_abort_shrink_u64, () => check_abort_shrink_unit]);
+    contract_harnesses!(rotate_left_inner, check_rotate_left_inner, [u8 => check_rotate_left_inner_u8, u64 => check_rotate_left_inner_u64, () => check_rotate_left_inner_unit]);
+    contract_harnesses!(rotate_right_inner, check_rotate_right_inner, [u8 => check_rotate_right_inner_u8, u64 => check_rotate_right_inner_u64, () => check_rotate_right_inner_unit]);
+
+    proof_harnesses!(check_get, [], [u8 => check_get_u8, u64 => check_get_u64, () => check_get_unit]);
+    proof_harnesses!(check_get_mut, [], [u8 => check_get_mut_u8, u64 => check_get_mut_u64, () => check_get_mut_unit]);
+    proof_harnesses!(check_swap, [], [u8 => check_swap_u8, u64 => check_swap_u64, () => check_swap_unit]);
+    proof_harnesses!(check_as_slices, [], [u8 => check_as_slices_u8, u64 => check_as_slices_u64, () => check_as_slices_unit]);
+    proof_harnesses!(check_as_mut_slices, [], [u8 => check_as_mut_slices_u8, u64 => check_as_mut_slices_u64, () => check_as_mut_slices_unit]);
+    proof_harnesses!(check_range, [], [u8 => check_range_u8, () => check_range_unit]);
+    proof_harnesses!(check_range_mut, [], [u8 => check_range_mut_u8, () => check_range_mut_unit]);
+    proof_harnesses!(check_drain, [], [u8 => check_drain_u8, () => check_drain_unit]);
+    proof_harnesses!(check_pop_front, [], [u8 => check_pop_front_u8, u64 => check_pop_front_u64, () => check_pop_front_unit]);
+    proof_harnesses!(check_pop_back, [], [u8 => check_pop_back_u8, u64 => check_pop_back_u64, () => check_pop_back_unit]);
+    proof_harnesses!(check_push_front, [], [u8 => check_push_front_u8, u64 => check_push_front_u64, () => check_push_front_unit]);
+    proof_harnesses!(check_push_back, [], [u8 => check_push_back_u8, u64 => check_push_back_u64, () => check_push_back_unit]);
+    proof_harnesses!(check_reserve, [], [u8 => check_reserve_u8, u64 => check_reserve_u64, () => check_reserve_unit]);
+    proof_harnesses!(check_reserve_exact, [], [u8 => check_reserve_exact_u8, () => check_reserve_exact_unit]);
+    proof_harnesses!(check_try_reserve, [], [u8 => check_try_reserve_u8, () => check_try_reserve_unit]);
+    proof_harnesses!(check_try_reserve_exact, [], [u8 => check_try_reserve_exact_u8, u64 => check_try_reserve_exact_u64, () => check_try_reserve_exact_unit]);
+    proof_harnesses!(check_shrink_to, [], [u8 => check_shrink_to_u8, u64 => check_shrink_to_u64, () => check_shrink_to_unit]);
+    proof_harnesses!(check_truncate, [], [u8 => check_truncate_u8, u64 => check_truncate_u64, () => check_truncate_unit]);
+    proof_harnesses!(check_insert, [], [u8 => check_insert_u8, () => check_insert_unit]);
+    proof_harnesses!(check_remove, [], [u8 => check_remove_u8, () => check_remove_unit]);
+    proof_harnesses!(check_split_off, [], [u8 => check_split_off_u8, u64 => check_split_off_u64, () => check_split_off_unit]);
+    proof_harnesses!(check_append, [], [u8 => check_append_u8, () => check_append_unit]);
+    proof_harnesses!(check_retain_mut, [], [u8 => check_retain_mut_u8, () => check_retain_mut_unit]);
+    // `grow` is only ever called on a full deque; for a zero-sized `T` that means
+    // `len == usize::MAX`, where growing panics with "capacity overflow" by design, so there
+    // is no non-panicking ZST instance to verify.
+    proof_harnesses!(check_grow, [], [u8 => check_grow_u8]);
+    proof_harnesses!(
+        check_resize_with,
+        [kani::stub(VecDeque::<u8>::write_iter_loop, stub_write_iter_loop_drop)],
+        [u8 => check_resize_with_u8]
+    );
+    proof_harnesses!(
+        check_resize_with,
+        [kani::stub(VecDeque::<()>::write_iter_loop, stub_write_iter_loop_drop)],
+        [() => check_resize_with_unit]
+    );
+    proof_harnesses!(
+        check_resize_with_grow,
+        [kani::stub(VecDeque::<u8>::write_iter_loop, stub_write_iter_loop_drop)],
+        [u8 => check_resize_with_grow_u8]
+    );
+    proof_harnesses!(
+        check_resize_with_grow,
+        [kani::stub(VecDeque::<()>::write_iter_loop, stub_write_iter_loop_drop)],
+        [() => check_resize_with_grow_unit]
+    );
+    proof_harnesses!(
+        check_make_contiguous,
+        [kani::stub(core::slice::rotate::ptr_rotate, stub_ptr_rotate)],
+        [u8 => check_make_contiguous_u8, () => check_make_contiguous_unit]
+    );
+    proof_harnesses!(check_rotate_left, [], [u8 => check_rotate_left_u8, () => check_rotate_left_unit]);
+    proof_harnesses!(check_rotate_right, [], [u8 => check_rotate_right_u8, () => check_rotate_right_unit]);
 
     #[kani::proof]
     fn check_vecdeque_swap() {
