@@ -39,7 +39,8 @@
 )]
 
 #[cfg(all(target_arch = "x86_64", any(kani, target_feature = "sse2")))]
-use safety::{loop_invariant, requires};
+use safety::loop_invariant;
+use safety::{ensures, requires};
 
 use crate::cmp::Ordering;
 use crate::convert::TryInto as _;
@@ -434,6 +435,30 @@ unsafe impl<'a> Searcher<'a> for CharSearcher<'a> {
         }
     }
     #[inline]
+    // Kani contract (a runtime no-op). `requires` restates the safety
+    // invariant documented on `CharSearcher`: both fingers are in-bounds
+    // char boundaries of the haystack (`into_searcher` establishes it and
+    // every method preserves it; see `verify`). `ensures` restates the
+    // `Searcher` guarantee this method gives its callers: a returned
+    // range is a needle-width range on char boundaries, at or after the
+    // finger on entry and within `finger_back`, and `finger` is left at
+    // its end; `None` leaves `finger` at `finger_back`. Only `finger` is
+    // written. Checked against this body by `verify::verify_cs_next_match`.
+    #[requires(self.finger <= self.finger_back
+        && self.finger_back <= self.haystack.len()
+        && self.haystack.is_char_boundary(self.finger)
+        && self.haystack.is_char_boundary(self.finger_back))]
+    #[ensures(|result| match *result {
+        Some((a, b)) => old(self.finger) <= a
+            && a < b
+            && b == self.finger
+            && b <= self.finger_back
+            && b - a == self.utf8_size()
+            && self.haystack.is_char_boundary(a)
+            && self.haystack.is_char_boundary(b),
+        None => self.finger == self.finger_back,
+    })]
+    #[cfg_attr(kani, kani::modifies(&self.finger))]
     fn next_match(&mut self) -> Option<(usize, usize)> {
         loop {
             // get the haystack after the last character found
@@ -501,6 +526,26 @@ unsafe impl<'a> ReverseSearcher<'a> for CharSearcher<'a> {
         }
     }
     #[inline]
+    // Kani contract (a runtime no-op); see `next_match`. A returned range
+    // is a needle-width range on char boundaries, at or before the
+    // `finger_back` on entry and at or after `finger`, and `finger_back`
+    // is left at its start; `None` leaves `finger_back` at `finger`. Only
+    // `finger_back` is written. Checked by `verify::verify_cs_next_match_back`.
+    #[requires(self.finger <= self.finger_back
+        && self.finger_back <= self.haystack.len()
+        && self.haystack.is_char_boundary(self.finger)
+        && self.haystack.is_char_boundary(self.finger_back))]
+    #[ensures(|result| match *result {
+        Some((a, b)) => a == self.finger_back
+            && a < b
+            && b == a + self.utf8_size()
+            && b <= old(self.finger_back)
+            && self.finger <= a
+            && self.haystack.is_char_boundary(a)
+            && self.haystack.is_char_boundary(b),
+        None => self.finger_back == self.finger,
+    })]
+    #[cfg_attr(kani, kani::modifies(&self.finger_back))]
     fn next_match_back(&mut self) -> Option<(usize, usize)> {
         let haystack = self.haystack.as_bytes();
         loop {
@@ -2045,25 +2090,105 @@ pub mod verify {
     //      an arbitrary `C`-satisfying state — not just reachable ones —
     //      then run the real method and re-assert `C`).
     //
-    // Verification is bounded: haystacks are arbitrary UTF-8 of up to
-    // HAYSTACK_BYTES bytes (all four UTF-8 width classes are reachable),
-    // needles are arbitrary `char`s, and unwind bounds are justified by
-    // the fact that every search-loop iteration advances a cursor by at
-    // least one byte. The inductive-step harnesses are unbounded in the
-    // searcher *state* given the haystack: they cover every state
-    // satisfying `C`, whether or not a call sequence reaches it.
+    // Accepted limitation: bounded haystack length.
+    //
+    // The challenge asks for proofs over haystacks of arbitrary size.
+    // These proofs are bounded in exactly one dimension: the haystack is
+    // at most `HAYSTACK_BYTES` bytes long, and every harness that runs a
+    // search loop carries the matching `#[kani::unwind]` bound. Within
+    // that bound the proofs are exhaustive:
+    //   - every haystack: contents and length are symbolic, so every
+    //     valid UTF-8 string of at most HAYSTACK_BYTES bytes, with every
+    //     combination of the four UTF-8 width classes that fits, is one
+    //     symbolic input;
+    //   - every needle: an arbitrary `char` (`CharSearcher`) or
+    //     `[char; 2]` (`MultiCharEqSearcher` and the wrappers);
+    //   - every searcher state: the inductive-step harnesses start from
+    //     an arbitrary `C`-satisfying state, a superset of the states any
+    //     call sequence reaches, so they are unbounded in the number of
+    //     calls made before the one under verification.
+    //
+    // Why HAYSTACK_BYTES = 5. A 4-byte (maximum-width) character plus one
+    // neighbour is the smallest haystack in which every case the search
+    // loops distinguish is reachable: every needle width; a memchr hit on
+    // a continuation byte that is *not* the end of the needle, which
+    // leaves `finger` mid-character for the next iteration (the
+    // `EA 81 81` case discussed in `CharSearcher::next_match`); a match
+    // preceded by such a false hit (a multi-iteration loop); the needle
+    // partially overlapping the end of the search window; and "found
+    // nothing". The `kani::cover`s in the harnesses witness that these
+    // arms execute.
+    //
+    // Why the unwind bounds are sound. Every iteration of every loop
+    // under verification moves a cursor by at least one byte
+    // (`finger += index + 1` / `finger_back = index` in the memchr loops;
+    // `next`/`next_back` consume one whole character in the trait
+    // defaults), so over a haystack of at most HAYSTACK_BYTES bytes a
+    // loop runs at most HAYSTACK_BYTES + 1 iterations and the bound
+    // HAYSTACK_BYTES + 2 unwinds it completely. Kani checks this: a bound
+    // that is too small fails the unwinding assertion rather than
+    // silently truncating the proof.
+    //
+    // Why the bound is not lifted with loop contracts. Four of the loops
+    // under verification are the generic `Searcher`/`ReverseSearcher`
+    // trait defaults (`next_match`, `next_reject`, `next_match_back`,
+    // `next_reject_back`), which loop over `self.next()`/`next_back()`.
+    // A loop invariant strong enough to re-enter `self.next()` safely
+    // must state the concrete searcher's `C`, which a generic trait body
+    // cannot name without changing shipped trait code. The unbounded
+    // argument for those loops is the inductive-step harnesses on
+    // `next`/`next_back` (the per-iteration lemma the loops need: one
+    // step from any `C`-state returns a boundary-valid range and
+    // re-establishes `C`) together with the bounded end-to-end harnesses
+    // that run the real default bodies. The two remaining loops,
+    // `CharSearcher::next_match`/`next_match_back`, are unwound within
+    // the same bound. Lifting it with a `#[safety::loop_invariant]` on
+    // those two loops was tried with the pinned Kani (branch
+    // `c20-loop-contracts-experiment` on the author's fork): with the
+    // invariant `finger <= finger_back && finger_back <= haystack.len()`,
+    // a symbolic-length haystack over a 16-byte backing array, and
+    // loop-free first/last-occurrence specifications of memchr/memrchr,
+    // every boundary assertion, the loop invariant and `C` verify in
+    // about 10 s per direction -- but the proofs cannot be merged: the
+    // slice comparison `slice == &self.utf8_encoded[..]` lowers to
+    // CBMC's builtin `memcmp`, whose internal locals are linked in after
+    // Kani's loop-modifies inference and so fail the loop-contract
+    // assigns check (four spurious "is assignable" failures per harness,
+    // nothing else). The comparison cannot be stubbed around it: the
+    // pinned Kani rejects a stub of the `compare_bytes` intrinsic
+    // ("invalid stub: function does not have a body, but is not an
+    // extern function") and cannot name the blanket `PartialEq` impl for
+    // `[u8]` (`<[u8] as crate::cmp::PartialEq<[u8]>>::eq`: "unable to
+    // find implementation of associated function `cmp::PartialEq::eq`
+    // for [u8]"), and an explicit `kani::loop_modifies` clause fails on
+    // the loop-body locals Kani hoists. That is a tool limitation to
+    // report upstream; the bounded proofs here are the shipped evidence.
+    //
+    // Contracts. `CharSearcher::next_match` and `next_match_back` carry
+    // their `Searcher` contract as `#[requires]`/`#[ensures]` attributes
+    // (runtime no-ops): the precondition is `C`, and the postcondition
+    // is the guarantee callers rely on -- a returned range is a
+    // needle-width range on char boundaries, at or after the finger on
+    // entry (at or before the `finger_back` on entry), and that finger
+    // is left at the range's end (start); `None` leaves the two fingers
+    // equal; nothing but that finger is written. `verify_cs_next_match`
+    // and `verify_cs_next_match_back` are the `#[kani::proof_for_contract]`
+    // harnesses that check the contract against the real bodies (within
+    // the bound above). This is what lets the `str` iterators (Challenge
+    // 22, `str::iter::verify`) compose with the searchers through
+    // `#[kani::stub_verified]` rather than assume anything about them.
     // ==================================================================
 
-    /// Maximum haystack size in bytes. 5 bytes fits a 4-byte (maximum
-    /// width) character plus a neighbor, so every UTF-8 width class and
-    /// multi-iteration search loops are covered.
+    /// Maximum haystack length in bytes — the one accepted bound of these
+    /// proofs (see the section comment). 5 fits a 4-byte (maximum-width)
+    /// character plus a neighbour, so every UTF-8 width class and every
+    /// arm of the search loops is reachable. Every loop under
+    /// verification advances a cursor by at least one byte per iteration,
+    /// so an unwind bound of `HAYSTACK_BYTES + 2` (the `#[kani::unwind]`
+    /// literals below are at least that) unwinds it completely: at most
+    /// HAYSTACK_BYTES + 1 iterations, plus one for the unwinding
+    /// assertion.
     const HAYSTACK_BYTES: usize = 5;
-
-    /// Unwind bound for loops that advance at least one byte per
-    /// iteration over a HAYSTACK_BYTES haystack (+1 for the final
-    /// iteration that observes the exhausted cursor, +1 for the
-    /// unwinding assertion itself).
-    const UNWIND: usize = HAYSTACK_BYTES + 2;
 
     /// An arbitrary UTF-8 string of 0..=N bytes written into a
     /// caller-owned buffer, built constructively as a concatenation of
@@ -2152,7 +2277,7 @@ pub mod verify {
     /// the fingers may transiently leave boundaries — the documented
     /// mid-loop state — but every public method must restore `C` on exit,
     /// which is exactly what these harnesses check.)
-    fn type_invariant_cs(s: &CharSearcher<'_>) -> bool {
+    pub fn type_invariant_cs(s: &CharSearcher<'_>) -> bool {
         let mut enc = [0u8; 4];
         let enc_len = s.needle.encode_utf8(&mut enc).len();
         s.finger <= s.finger_back
@@ -2168,7 +2293,7 @@ pub mod verify {
     /// `C`-satisfying state, a superset of the states reachable by call
     /// sequences from `into_searcher` (whose base case is
     /// `verify_cs_into_searcher`).
-    fn any_char_searcher(haystack: &str) -> CharSearcher<'_> {
+    pub fn any_char_searcher(haystack: &str) -> CharSearcher<'_> {
         let needle: char = kani::any();
         let mut utf8_encoded = [0u8; 4];
         let utf8_size = needle.encode_utf8(&mut utf8_encoded).len() as u8;
@@ -2181,10 +2306,26 @@ pub mod verify {
     }
 
     /// Criterion 2's safety property for a returned index pair.
-    fn assert_valid_range(haystack: &str, a: usize, b: usize) {
+    pub fn assert_valid_range(haystack: &str, a: usize, b: usize) {
         assert!(a <= b && b <= haystack.len());
         assert!(haystack.is_char_boundary(a));
         assert!(haystack.is_char_boundary(b));
+    }
+
+    /// `CharSearcher::finger`, for invariants stated outside this module
+    /// (the fields are private to `str::pattern`).
+    pub fn cs_finger(s: &CharSearcher<'_>) -> usize {
+        s.finger
+    }
+
+    /// `CharSearcher::finger_back`, for invariants stated outside this module.
+    pub fn cs_finger_back(s: &CharSearcher<'_>) -> usize {
+        s.finger_back
+    }
+
+    /// `CharSearcher::needle`, for invariants stated outside this module.
+    pub fn cs_needle(s: &CharSearcher<'_>) -> char {
+        s.needle
     }
 
     /// Criterion 1: `char::into_searcher` establishes `C`.
@@ -2234,11 +2375,15 @@ pub mod verify {
         assert!(type_invariant_cs(&s));
     }
 
-    /// Criteria 2+3 for the real `CharSearcher::next_match` — the memchr
+    /// Contract proof for the real `CharSearcher::next_match` (the memchr
     /// loop, with memchr replaced by the semantically identical
-    /// `stub_memchr` (see above). Every loop iteration advances `finger`
-    /// by at least one byte, so UNWIND fully unwinds the search.
-    #[kani::proof]
+    /// `stub_memchr`, see above) and criteria 2+3 for it: Kani assumes
+    /// the `#[requires]` (which `any_char_searcher` establishes anyway),
+    /// checks the `#[ensures]` and the write set on return, and the body
+    /// re-asserts the boundary property and `C`. Every loop iteration
+    /// advances `finger` by at least one byte, so the unwind bound fully
+    /// unwinds the search.
+    #[kani::proof_for_contract(CharSearcher::next_match)]
     #[kani::unwind(7)]
     #[kani::stub(crate::slice::memchr::memchr, stub_memchr)]
     pub fn verify_cs_next_match() {
@@ -2256,11 +2401,11 @@ pub mod verify {
         assert!(type_invariant_cs(&s));
     }
 
-    /// Criteria 2+3 for the real `CharSearcher::next_match_back` — the
+    /// Contract proof for the real `CharSearcher::next_match_back` (the
     /// memrchr loop, with memrchr replaced by the semantically identical
-    /// `stub_memrchr`. Every iteration decreases `finger_back` by at
-    /// least one byte.
-    #[kani::proof]
+    /// `stub_memrchr`) and criteria 2+3 for it, as `verify_cs_next_match`.
+    /// Every iteration decreases `finger_back` by at least one byte.
+    #[kani::proof_for_contract(CharSearcher::next_match_back)]
     #[kani::unwind(7)]
     #[kani::stub(crate::slice::memchr::memrchr, stub_memrchr)]
     pub fn verify_cs_next_match_back() {
@@ -2280,7 +2425,7 @@ pub mod verify {
 
     /// Criteria 2+3 for `CharSearcher::next_reject` — the real trait
     /// default, looping over the real `next()`. Each `next()` consumes at
-    /// least one byte, so UNWIND fully unwinds the loop.
+    /// least one byte, so the unwind bound fully unwinds the loop.
     #[kani::proof]
     #[kani::unwind(7)]
     pub fn verify_cs_next_reject() {
