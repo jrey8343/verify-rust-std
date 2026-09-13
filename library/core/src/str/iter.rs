@@ -1617,346 +1617,894 @@ escape_types_impls!(EscapeDebug, EscapeDefault, EscapeUnicode);
 #[cfg(kani)]
 #[unstable(feature = "kani", issue = "none")]
 pub mod verify {
+    use super::super::pattern::verify::{
+        PAD, any_char_searcher, any_utf8, cs_finger, cs_finger_back, cs_needle, type_invariant_cs,
+        utf8_local,
+    };
+    use super::super::validations::{utf8_char_width, utf8_is_cont_byte};
     use super::*;
 
     // =================================================================
     // Challenge 22: verify safety of str iter functions.
     //
-    // Every harness runs the real, unmodified iterator code — no
-    // production code path is compiled out under Kani — driving the real
-    // `core::str::pattern` searchers (verified in #537/#538) underneath.
-    // Verification is bounded: haystacks are arbitrary UTF-8 of up to
-    // HAYSTACK_BYTES symbolic bytes (contents and length symbolic,
-    // multibyte characters included), patterns are fully symbolic
-    // `char`s, and unwind bounds are stated per harness. The only stubs
-    // are `core::slice::memchr::{memchr,memrchr}`, replaced per-harness
-    // by semantically identical naive scans (Challenge 22 assumption 1:
-    // the slice module may be assumed correct; same pattern as accepted
-    // in #544) — the optimized word-at-a-time scans are too expensive
-    // for CBMC.
+    // Every harness runs the real, unmodified iterator code; no product
+    // code path is compiled out under Kani. The proofs are unbounded in
+    // the two dimensions the challenge cares about:
+    //
+    //   - String length. The haystack is a symbolic-length slice of an
+    //     arbitrary byte array constrained to valid UTF-8 by a loop-free
+    //     byte-table predicate (`pattern::verify::any_utf8`); every valid
+    //     UTF-8 string of at most HAY_MAX bytes — contents, length and
+    //     character widths all symbolic — is one input. HAY_MAX is the
+    //     size of the symbolic backing allocation, a CBMC memory-model
+    //     parameter (as `ARR_SIZE` in
+    //     `str::validations::verify::check_run_utf8_validation` and
+    //     `HAY_MAX` in `str::pattern::verify`); no loop is unwound to it.
+    //   - Iterator state. Following the Challenge 20 methodology, each
+    //     iterator type has a type invariant `C`; a base-case harness
+    //     shows the constructors establish `C`, and every method harness
+    //     starts from an *arbitrary* `C`-satisfying state (a superset of
+    //     the states any call sequence reaches), runs the method, asserts
+    //     the safety facts the unsafe blocks rely on (`str::get_unchecked`
+    //     only checks bounds, so char-boundary-ness of every produced
+    //     index and slice is asserted explicitly) and re-asserts `C`.
+    //
+    // The pattern searchers. The `SplitInternal`/`MatchesInternal`/
+    // `MatchIndicesInternal` bodies contain no loops; every loop they can
+    // reach is inside `CharSearcher::next_match`/`next_match_back`
+    // (`str::pattern`). Challenge 22 assumption 2 allows assuming the
+    // safety and functional correctness of everything in `pattern.rs`;
+    // these harnesses assume strictly less than that: the two methods are
+    // replaced (`#[kani::stub_verified]`) by their *function contract*,
+    // which is the `Searcher` trait's documented guarantee (indices on
+    // char boundaries) plus the struct's documented finger invariant, is
+    // attached to the real, byte-identical method bodies, and is checked
+    // against those bodies by `pattern::verify::verify_cs_next_match`/
+    // `verify_cs_next_match_back` (`#[kani::proof_for_contract]`). Under
+    // `stub_verified` each call site asserts the contract's precondition
+    // (`C` for the searcher) and assumes its postcondition; nothing about
+    // boundaries is `kani::assume`d by these harnesses. Lifting the
+    // searcher loops themselves with loop contracts is not possible with
+    // the pinned Kani: the slice comparison inside them lowers to CBMC's
+    // builtin `memcmp`, whose locals fail the loop-contract assigns check,
+    // and neither the `compare_bytes` intrinsic ("invalid stub: function
+    // does not have a body") nor `<[u8] as PartialEq>::eq` ("unable to
+    // find implementation ... for [u8]") can be stubbed around it. The
+    // contract proofs in `pattern::verify` therefore keep Challenge 20's
+    // bounded haystack; that bound is the one accepted limitation of
+    // this suite and it lives entirely inside Challenge 20's scope.
+    //
+    // `Chars::advance_by` is the only target function with loops. Its
+    // harness is unbounded in string length and bounded only in the
+    // advance count `n` (`ADVANCE_MAX`); every unwind bound derives from
+    // `ADVANCE_MAX` and the constant chunk size, never from the string
+    // length. See `check_chars_advance_by` for why loop contracts cannot
+    // be applied to those loops with the pinned Kani.
+    //
+    // Harness-writing rules (both consequences of CI's `-Z loop-contracts`):
+    // never filter inputs through `from_utf8` (its loop invariants make
+    // the result unreliable), and never reach a `#[safety::loop_invariant]`
+    // (`from_utf8`, `is_ascii`, `chars().count()`, ...) from a harness,
+    // which silently switches it into loop-contract mode. Equality of
+    // string slices is checked by pointer and length (`same_str`) rather
+    // than `==`, which lowers to `memcmp` over the whole slice.
     // =================================================================
 
-    /// 5 bytes fits a 4-byte (maximum width) character plus a neighbor,
-    /// so all UTF-8 width classes and multi-step iteration are covered.
-    const HAYSTACK_BYTES: usize = 5;
+    /// Maximum haystack length in bytes: the size of the symbolic backing
+    /// allocation, not a loop bound (see the module comment). Haystack
+    /// lengths range over `0..=HAY_MAX`; 256 keeps every harness within
+    /// a few minutes under CI's flags (at 1000 they take ~10 minutes
+    /// each and `check_chars_advance_by` over an hour).
+    // TODO: HAY_MAX can be much larger with cbmc argument `--arrays-uf-always`
+    const HAY_MAX: usize = 256;
+    /// Size of the backing array behind a `HAY_MAX`-byte haystack.
+    const HAY_ARR: usize = HAY_MAX + PAD;
 
-    /// An arbitrary UTF-8 string of 0..=N bytes written into a
-    /// caller-owned buffer, built constructively as a concatenation of
-    /// symbolic `char`s (validity holds by construction — under CI's
-    /// `-Z loop-contracts` the loop invariants inside
-    /// `run_utf8_validation` make `from_utf8`'s functional result
-    /// unreliable as a filter). The steps are unrolled so harnesses can
-    /// use tight unwind bounds.
-    fn symbolic_str<const N: usize>(buf: &mut [u8; N]) -> &str {
-        let mut len = 0usize;
-        {
-            let mut step = || {
-                if kani::any() {
-                    let c: char = kani::any();
-                    let w = c.len_utf8();
-                    if len + w <= N {
-                        c.encode_utf8(&mut buf[len..]);
-                        len += w;
-                    }
-                }
-            };
-            step();
-            step();
-            step();
-            step();
-            step();
-        }
-        // SAFETY: `buf[..len]` is a concatenation of UTF-8 encodings of
-        // `char`s, hence valid UTF-8 by construction.
-        unsafe { from_utf8_unchecked(&buf[..len]) }
+    /// An arbitrary haystack: a valid UTF-8 string of symbolic length
+    /// `0..=N - PAD` (contents, length and character widths symbolic),
+    /// via the byte-table input model shared with `str::pattern::verify`
+    /// (`utf8_local`/`any_utf8`; see there for why `from_utf8` cannot be
+    /// the filter).
+    fn any_haystack<const N: usize>(arr: &[u8; N]) -> &str {
+        let s = any_utf8(arr);
+        kani::cover(s.len() == N - PAD, "a haystack of the maximum length");
+        s
     }
 
-    /// Semantically identical replacement for `slice::memchr::memchr`
-    /// (first occurrence): no nondeterminism, no `kani::assume`; fully
-    /// unwound by the harness bounds.
-    fn stub_memchr(x: u8, text: &[u8]) -> Option<usize> {
-        let mut i = 0;
-        while i < text.len() {
-            if text[i] == x {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
+    /// Identity of two string slices (same address and length). Used
+    /// instead of `==`, which lowers to `memcmp` over the whole slice.
+    fn same_str(a: &str, b: &str) -> bool {
+        a.as_ptr() == b.as_ptr() && a.len() == b.len()
     }
 
-    /// Semantically identical replacement for `slice::memchr::memrchr`
-    /// (last occurrence).
-    fn stub_memrchr(x: u8, text: &[u8]) -> Option<usize> {
-        let mut i = text.len();
-        while i > 0 {
-            i -= 1;
-            if text[i] == x {
-                return Some(i);
-            }
-        }
-        None
+    /// Byte offset of `sub` inside `s`; `sub` must be a subslice of `s`.
+    fn offset_in(s: &str, sub: &str) -> usize {
+        sub.as_ptr().addr() - s.as_ptr().addr()
     }
 
-    /// `Chars::next`: real `next_code_point`, checked against the
-    /// remainder length.
+    /// An arbitrary in-bounds char-boundary window `k..m` of `s`.
+    fn any_window(s: &str) -> (usize, usize) {
+        let k: usize = kani::any();
+        let m: usize = kani::any();
+        kani::assume(k <= m && m <= s.len());
+        kani::assume(s.is_char_boundary(k) && s.is_char_boundary(m));
+        (k, m)
+    }
+
+    /// The window `k..m` of `s` as returned by `any_window`.
+    fn window(s: &str, k: usize, m: usize) -> &str {
+        // SAFETY: `any_window` assumed `k <= m <= s.len()` and that both
+        // are char boundaries.
+        unsafe { s.get_unchecked(k..m) }
+    }
+
+    // ------------------------------------------------------------------
+    // Chars
+    //
+    // Type invariant: the iterator's bytes are a char-boundary window of
+    // a valid UTF-8 string (the `str` invariant `Chars` documents). Every
+    // state reachable by `next`/`next_back`/`advance_by` from `s.chars()`
+    // is such a window, and every window is reachable as
+    // `s[k..m].chars()`, so the harnesses start from an arbitrary window.
+    // ------------------------------------------------------------------
+
+    /// `Chars::next`: the real `next_code_point` (whose
+    /// `char::from_u32_unchecked` result Kani checks for validity) on an
+    /// arbitrary window; the consumed prefix is one whole character.
     #[kani::proof]
-    #[kani::unwind(8)]
     pub fn check_chars_next() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let mut it = s.chars();
-        let before = it.as_str().len();
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let (k, m) = any_window(s);
+        let w = window(s, k, m);
+        let mut it = w.chars();
         match it.next() {
             Some(c) => {
-                assert_eq!(it.as_str().len() + c.len_utf8(), before);
-                kani::cover(c.len_utf8() > 1, "multibyte char consumed");
+                let rest = it.as_str();
+                assert!(rest.len() + c.len_utf8() == w.len());
+                assert!(offset_in(s, rest) == k + c.len_utf8());
+                assert!(s.is_char_boundary(k + c.len_utf8()));
+                kani::cover(c.len_utf8() == 1, "1-byte char consumed");
+                kani::cover(c.len_utf8() == 2, "2-byte char consumed");
+                kani::cover(c.len_utf8() == 3, "3-byte char consumed");
+                kani::cover(c.len_utf8() == 4, "4-byte char consumed");
             }
-            None => assert_eq!(before, 0),
+            None => {
+                assert!(w.is_empty());
+                kani::cover(true, "empty window");
+            }
         }
     }
 
-    /// `Chars::next_back`: real `next_code_point_reverse`.
+    /// `Chars::next_back`: the real `next_code_point_reverse` on an
+    /// arbitrary window; the consumed suffix is one whole character.
     #[kani::proof]
-    #[kani::unwind(8)]
     pub fn check_chars_next_back() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let mut it = s.chars();
-        let before = it.as_str().len();
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let (k, m) = any_window(s);
+        let w = window(s, k, m);
+        let mut it = w.chars();
         match it.next_back() {
-            Some(c) => assert_eq!(it.as_str().len() + c.len_utf8(), before),
-            None => assert_eq!(before, 0),
+            Some(c) => {
+                let rest = it.as_str();
+                assert!(rest.len() + c.len_utf8() == w.len());
+                assert!(offset_in(s, rest) == k);
+                assert!(s.is_char_boundary(m - c.len_utf8()));
+                kani::cover(c.len_utf8() == 1, "1-byte char consumed");
+                kani::cover(c.len_utf8() == 2, "2-byte char consumed");
+                kani::cover(c.len_utf8() == 3, "3-byte char consumed");
+                kani::cover(c.len_utf8() == 4, "4-byte char consumed");
+            }
+            None => {
+                assert!(w.is_empty());
+                kani::cover(true, "empty window");
+            }
         }
     }
 
-    /// `Chars::advance_by`: the real chunked-skip, continuation-byte,
-    /// and per-char loops (the chunk loop is enterable but empty at this
-    /// input size — `as_chunks::<32>` of <= 5 bytes yields no chunks;
-    /// the other two loops run for real). `remainder` is fully symbolic.
+    /// `Chars::as_str` (`from_utf8_unchecked` over the iterator's bytes)
+    /// on an arbitrary window, and again after consuming from both ends.
     #[kani::proof]
-    #[kani::unwind(8)]
-    pub fn check_chars_advance_by() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let n_chars = s.chars().count();
-        let mut it = s.chars();
-        let n: usize = kani::any();
+    pub fn check_chars_as_str() {
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let (k, m) = any_window(s);
+        let w = window(s, k, m);
+        let mut it = w.chars();
+        assert!(same_str(it.as_str(), w));
+        let front = it.next().map_or(0, char::len_utf8);
+        let back = it.next_back().map_or(0, char::len_utf8);
+        let rest = it.as_str();
+        assert!(offset_in(s, rest) == k + front);
+        assert!(rest.len() + front + back == w.len());
+        assert!(s.is_char_boundary(k + front) && s.is_char_boundary(m - back));
+        kani::cover(front > 0 && back > 0, "consumed from both ends");
+    }
+
+    /// Advance-count bound of `check_chars_advance_by`, the per-character
+    /// path of `Chars::advance_by` (counts below `CHUNK_SIZE` never enter
+    /// the chunk-skip phase).
+    const ADVANCE_MAX: usize = 8;
+    /// Backing-array size of `check_chars_advance_by`. Its per-character
+    /// loop is unwound, so unlike the loop-free harnesses its memory use
+    /// grows with the array (4.8 GB at HAY_MAX, 1.1 GB at 96); 128 keeps
+    /// it inside the budget of CI's macOS runners. Like HAY_MAX it is the
+    /// size of the symbolic backing allocation, not a loop bound.
+    const ADVANCE_HAY_MAX: usize = 128;
+    const ADVANCE_ARR: usize = ADVANCE_HAY_MAX + PAD;
+    /// Advance-count range of `check_chars_advance_by_chunked`, the
+    /// chunk-skip path: at least 33 so the chunk-skip loop body runs (it
+    /// runs while more than 32 characters remain to be skipped and a full
+    /// 32-byte chunk is available), at most 40 so it runs exactly once (a
+    /// 32-byte chunk of valid UTF-8 holds at least 8 characters, so
+    /// afterwards at most 32 remain and the guard fails).
+    const CHUNKED_MIN: usize = 33;
+    const CHUNKED_MAX: usize = 40;
+    /// String length of `check_chars_advance_by_chunked`: one full 32-byte
+    /// chunk plus a 16-byte tail. The length is a compile-time constant
+    /// (the contents are fully symbolic) because CBMC only drops the
+    /// unrolled copies of the chunk-skip loop when the chunk iterator's
+    /// end is known at unwinding time: each copy of that loop body reads
+    /// a whole chunk at a symbolic offset and runs two 32-iteration
+    /// loops, and with a symbolic string length -- or a symbolic start of
+    /// a fixed-length window -- the 33 copies the unwind bound implies
+    /// exceed 11 GB. So the chunk-skip path is verified for every
+    /// 48-byte string; the per-character path (`check_chars_advance_by`)
+    /// for arbitrary windows of strings of arbitrary length.
+    const CHUNKED_WINDOW: usize = 48;
+    const _: () = assert!(ADVANCE_MAX <= WALK_MAX && CHUNKED_MAX <= WALK_MAX);
+    /// Number of unrolled steps in `walk`.
+    const WALK_MAX: usize = 40;
+
+    /// Reference for `advance_by`: the position reached by skipping up to
+    /// `n <= WALK_MAX` characters from `off` (never past `m`) and the
+    /// number of characters skipped. Loop-free: `WALK_MAX` unrolled
+    /// conditional `utf8_char_width` steps, so it adds nothing to the
+    /// harness's unwind bound.
+    fn walk(bytes: &[u8], off: usize, m: usize, n: usize) -> (usize, usize) {
+        let mut off = off;
+        let mut steps = 0;
+        macro_rules! step {
+            () => {
+                if steps < n && off < m {
+                    off += utf8_char_width(bytes[off]);
+                    steps += 1;
+                }
+            };
+        }
+        macro_rules! steps8 {
+            () => {
+                step!();
+                step!();
+                step!();
+                step!();
+                step!();
+                step!();
+                step!();
+                step!();
+            };
+        }
+        // WALK_MAX = 5 * 8 steps
+        steps8!();
+        steps8!();
+        steps8!();
+        steps8!();
+        steps8!();
+        (off, steps)
+    }
+
+    /// Shared body of the two `advance_by` harnesses: the real
+    /// `Chars::advance_by` on the window `k..m` of `s` for the advance
+    /// count `n`, checked against `walk`. The remainder must start exactly
+    /// where the walk ends (and so on a char boundary); `Ok` iff `n`
+    /// characters were available, otherwise `Err(n - characters)`.
+    fn check_advance_by(s: &str, k: usize, m: usize, n: usize) -> (usize, usize) {
+        let bytes = s.as_bytes();
+        let (off, steps) = walk(bytes, k, m, n);
+
+        let mut it = window(s, k, m).chars();
         let res = it.advance_by(n);
+        let rest = it.as_str();
+        assert!(offset_in(s, rest) == off);
+        assert!(rest.len() == m - off);
+        assert!(s.is_char_boundary(off));
         match res {
             Ok(()) => {
-                assert!(n <= n_chars);
+                assert!(steps == n);
                 kani::cover(n > 0, "advanced by a nonzero count");
             }
-            Err(rem) => assert_eq!(rem.get(), n - n_chars),
+            Err(rem) => {
+                assert!(off == m);
+                assert!(rem.get() == n - steps);
+                kani::cover(true, "ran out of characters");
+            }
         }
-        // The remainder is still valid UTF-8 viewed as a str.
-        let _ = it.as_str();
+        (off, steps)
     }
 
-    /// `Chars::as_str` on a partially consumed iterator.
+    /// `Chars::advance_by`, per-character path: the real per-character
+    /// loop on an arbitrary window of a string of arbitrary length, for
+    /// counts up to `ADVANCE_MAX`. The unwind bound follows from
+    /// `ADVANCE_MAX` alone (the loop decrements `remainder` each
+    /// iteration); the string length plays no part in it.
+    ///
+    /// Loop contracts are not used on `advance_by`'s loops because, with
+    /// the pinned Kani, the invariant of a loop that advances a
+    /// `slice::Iter` through a method call cannot be stated: loop-modifies
+    /// inference misses fields written by callees (Kani reference, loop
+    /// contracts, limitations), and after the iterator is havocked its
+    /// `len()`/`as_slice()` trip the same-allocation check in Kani's
+    /// `ptr_offset_from` model before an invariant could re-pin it.
     #[kani::proof]
-    #[kani::unwind(8)]
-    pub fn check_chars_as_str() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let mut it = s.chars();
-        let _ = it.next();
-        let rest = it.as_str();
-        assert!(rest.len() <= s.len());
+    #[kani::unwind(9)]
+    pub fn check_chars_advance_by() {
+        let arr: [u8; ADVANCE_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let (k, m) = any_window(s);
+        let n: usize = kani::any();
+        kani::assume(n <= ADVANCE_MAX);
+        let (off, _) = check_advance_by(s, k, m, n);
+        kani::cover(n > 0 && off - k == 4 * n, "skipped only 4-byte characters");
     }
 
-    /// `SplitInternal::next` (+ `get_end` on exhaustion) via the public
-    /// `split` iterator, with a fully symbolic `char` pattern driving the
-    /// real `CharSearcher::next_match` (naive memchr stub).
+    /// `Chars::advance_by`, chunk-skip path: the real chunk-skip loop (its
+    /// body runs exactly once for these counts, see `CHUNKED_MAX`), the
+    /// trailing-continuation loop and the per-character loop, on a
+    /// `CHUNKED_WINDOW`-byte string of arbitrary contents. The unwind
+    /// bound is 34: the two loops over a chunk run 32 times, the
+    /// per-character loop at most 16 times (the bytes left after the
+    /// chunk), the trailing-continuation loop at most 3 (a character has
+    /// at most 3 continuation bytes); CBMC's unwinding assertions check
+    /// these counts rather than assume them.
     #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memchr, stub_memchr)]
+    #[kani::unwind(34)]
+    pub fn check_chars_advance_by_chunked() {
+        let arr: [u8; CHUNKED_WINDOW + PAD] = kani::any();
+        kani::assume(utf8_local(&arr, CHUNKED_WINDOW));
+        // SAFETY: `utf8_local` is the byte-table definition of UTF-8
+        // validity of `arr[..CHUNKED_WINDOW]` (see `pattern::verify`).
+        let s = unsafe { from_utf8_unchecked(&arr[..CHUNKED_WINDOW]) };
+        let bytes = s.as_bytes();
+        let n: usize = kani::any();
+        kani::assume(CHUNKED_MIN <= n && n <= CHUNKED_MAX);
+        check_advance_by(s, 0, CHUNKED_WINDOW, n);
+        kani::cover(
+            utf8_is_cont_byte(bytes[32]),
+            "trailing-continuation loop skipped a byte after the chunk",
+        );
+        kani::cover(
+            bytes[0] >= 0xF0
+                && bytes[4] >= 0xF0
+                && bytes[8] >= 0xF0
+                && bytes[12] >= 0xF0
+                && bytes[16] >= 0xF0
+                && bytes[20] >= 0xF0
+                && bytes[24] >= 0xF0
+                && bytes[28] >= 0xF0,
+            "chunk of eight 4-byte characters (the fewest a chunk can hold)",
+        );
+        kani::cover(bytes[0] < 0x80 && bytes[31] < 0x80, "chunk starting and ending in ASCII");
+    }
+
+    // ------------------------------------------------------------------
+    // SplitInternal<'_, char>
+    //
+    // Type invariant `C`: the searcher satisfies its own invariant, the
+    // unconsumed range `start..end` is a char-boundary range of the
+    // haystack, and the searcher's fingers lie within it
+    // (`start <= finger` and `finger_back <= end`). The constructors
+    // establish it (`check_split_constructors_establish_invariant`); every
+    // reachable state in fact has `start == finger`, and `finger_back ==
+    // end` except after `next_back_inclusive` (which leaves `end` at the
+    // match end while `finger_back` is at its start), so the arbitrary
+    // `C`-states below are a superset of the reachable ones.
+    // ------------------------------------------------------------------
+
+    /// Type invariant `C` of `SplitInternal<'_, char>`.
+    fn split_invariant(it: &SplitInternal<'_, char>) -> bool {
+        let h = it.matcher.haystack();
+        type_invariant_cs(&it.matcher)
+            && it.start <= cs_finger(&it.matcher)
+            && cs_finger_back(&it.matcher) <= it.end
+            && it.end <= h.len()
+            && h.is_char_boundary(it.start)
+            && h.is_char_boundary(it.end)
+    }
+
+    /// An arbitrary `C`-satisfying `SplitInternal` over `s` with a
+    /// symbolic `char` pattern and symbolic flags.
+    fn any_split(s: &str) -> SplitInternal<'_, char> {
+        let it = SplitInternal {
+            start: kani::any(),
+            end: kani::any(),
+            matcher: any_char_searcher(s),
+            allow_trailing_empty: kani::any(),
+            finished: kani::any(),
+        };
+        kani::assume(split_invariant(&it));
+        it
+    }
+
+    /// Snapshot of the parts of a `SplitInternal` state that a method must
+    /// leave alone, checked after the call.
+    struct SplitFrame {
+        start: usize,
+        end: usize,
+        finger: usize,
+        finger_back: usize,
+        needle: char,
+    }
+
+    fn split_frame(it: &SplitInternal<'_, char>) -> SplitFrame {
+        SplitFrame {
+            start: it.start,
+            end: it.end,
+            finger: cs_finger(&it.matcher),
+            finger_back: cs_finger_back(&it.matcher),
+            needle: cs_needle(&it.matcher),
+        }
+    }
+
+    /// `part` is the char-boundary range `lo..hi` of `s` (by address).
+    fn assert_is_range(s: &str, part: &str, lo: usize, hi: usize) {
+        assert!(offset_in(s, part) == lo);
+        assert!(lo + part.len() == hi);
+        assert!(hi <= s.len());
+        assert!(s.is_char_boundary(lo) && s.is_char_boundary(hi));
+    }
+
+    /// Criterion 1: `split`, `split_terminator` and `split_inclusive`
+    /// establish `C`.
+    #[kani::proof]
+    pub fn check_split_constructors_establish_invariant() {
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let p: char = kani::any();
+        let a = s.split(p).0;
+        assert!(split_invariant(&a) && a.start == 0 && a.end == s.len() && !a.finished);
+        let b = s.split_terminator(p).0;
+        assert!(split_invariant(&b) && b.start == 0 && b.end == s.len() && !b.finished);
+        let c = s.split_inclusive(p).0;
+        assert!(split_invariant(&c) && c.start == 0 && c.end == s.len() && !c.finished);
+    }
+
+    /// `SplitInternal::next` from an arbitrary `C`-state: the fragment is
+    /// `start..a` for the match `a..b` the searcher contract returns, the
+    /// new `start` is `b`, and on exhaustion `get_end` yields
+    /// `start..end` at most once.
+    #[kani::proof]
+    #[kani::stub_verified(crate::str::pattern::CharSearcher::next_match)]
     pub fn check_split_next() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.split(p);
-        if let Some(part) = it.next() {
-            assert!(part.len() <= s.len());
-            kani::cover(!part.is_empty(), "nonempty first fragment");
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it = any_split(s);
+        let f = split_frame(&it);
+        let finished = it.finished;
+        match it.next() {
+            Some(part) => {
+                assert!(!finished);
+                if it.finished {
+                    assert_is_range(s, part, f.start, f.end);
+                    assert!(it.start == f.start);
+                    kani::cover(true, "next: trailing fragment from get_end");
+                } else {
+                    let a = f.start + part.len();
+                    assert_is_range(s, part, f.start, a);
+                    assert!(a >= f.finger);
+                    assert!(it.start == a + f.needle.len_utf8());
+                    assert!(it.start == cs_finger(&it.matcher));
+                    kani::cover(part.is_empty(), "next: empty fragment between adjacent matches");
+                    kani::cover(!part.is_empty(), "next: nonempty fragment");
+                }
+            }
+            None => {
+                assert!(it.finished);
+                kani::cover(finished, "next: already finished");
+                kani::cover(!finished, "next: exhausted without a trailing fragment");
+            }
         }
-        if let Some(part) = it.next() {
-            assert!(part.len() <= s.len());
-            kani::cover(true, "second fragment produced");
-        }
+        assert!(split_invariant(&it));
+        assert!(it.end == f.end);
+        assert!(cs_finger_back(&it.matcher) == f.finger_back);
+        assert!(cs_needle(&it.matcher) == f.needle);
+        assert!(same_str(it.matcher.haystack(), s));
     }
 
-    /// `SplitInternal::next_inclusive` via `split_inclusive`.
+    /// `SplitInternal::next_inclusive` from an arbitrary `C`-state: the
+    /// fragment is `start..b` and the new `start` is `b`.
     #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memchr, stub_memchr)]
-    pub fn check_split_inclusive_next() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.split_inclusive(p);
-        if let Some(part) = it.next() {
-            assert!(part.len() <= s.len());
+    #[kani::stub_verified(crate::str::pattern::CharSearcher::next_match)]
+    pub fn check_split_next_inclusive() {
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it = any_split(s);
+        let f = split_frame(&it);
+        let finished = it.finished;
+        match it.next_inclusive() {
+            Some(part) => {
+                assert!(!finished);
+                if it.finished {
+                    assert_is_range(s, part, f.start, f.end);
+                    assert!(it.start == f.start);
+                    kani::cover(true, "next_inclusive: trailing fragment from get_end");
+                } else {
+                    let b = f.start + part.len();
+                    assert_is_range(s, part, f.start, b);
+                    assert!(part.len() >= f.needle.len_utf8());
+                    assert!(it.start == b);
+                    assert!(it.start == cs_finger(&it.matcher));
+                    kani::cover(
+                        part.len() == f.needle.len_utf8(),
+                        "next_inclusive: fragment is just the separator",
+                    );
+                    kani::cover(
+                        part.len() > f.needle.len_utf8(),
+                        "next_inclusive: fragment with content before the separator",
+                    );
+                }
+            }
+            None => {
+                assert!(it.finished);
+                kani::cover(finished, "next_inclusive: already finished");
+                kani::cover(!finished, "next_inclusive: exhausted without a trailing fragment");
+            }
         }
+        assert!(split_invariant(&it));
+        assert!(it.end == f.end);
+        assert!(cs_finger_back(&it.matcher) == f.finger_back);
+        assert!(cs_needle(&it.matcher) == f.needle);
+        assert!(same_str(it.matcher.haystack(), s));
     }
 
-    /// `SplitInternal::next_back` (which drives
-    /// `CharSearcher::next_match_back` — naive memrchr stub — and
-    /// `get_end`) via the double-ended `split` iterator.
+    /// `SplitInternal::next_back` from an arbitrary `C`-state, including
+    /// the `allow_trailing_empty == false` path that first calls itself
+    /// to drop an empty trailing fragment: every fragment is a
+    /// char-boundary sub-range of the unconsumed range, `end` only
+    /// decreases, and `start` is untouched.
     #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memrchr, stub_memrchr)]
+    #[kani::stub_verified(crate::str::pattern::CharSearcher::next_match_back)]
     pub fn check_split_next_back() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.split(p);
-        if let Some(part) = it.next_back() {
-            assert!(part.len() <= s.len());
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it = any_split(s);
+        let f = split_frame(&it);
+        let finished = it.finished;
+        let trailing = it.allow_trailing_empty;
+        match it.next_back() {
+            Some(part) => {
+                assert!(!finished);
+                let lo = offset_in(s, part);
+                let hi = lo + part.len();
+                assert!(f.start <= lo && hi <= f.end);
+                assert!(s.is_char_boundary(lo) && s.is_char_boundary(hi));
+                if it.finished {
+                    // the final fragment `start..end` (of the range as it
+                    // was when the searcher ran out of matches)
+                    assert!(lo == f.start);
+                    kani::cover(true, "next_back: final fragment");
+                } else {
+                    // `b..end` for a match `a..b` at or after `finger`;
+                    // `end` becomes `a`
+                    assert!(lo > f.finger);
+                    assert!(it.end == cs_finger_back(&it.matcher));
+                    assert!(it.end + f.needle.len_utf8() == lo);
+                    kani::cover(part.is_empty(), "next_back: empty fragment");
+                    kani::cover(!part.is_empty(), "next_back: nonempty fragment");
+                }
+                kani::cover(
+                    !trailing && !part.is_empty(),
+                    "next_back: fragment returned with allow_trailing_empty == false",
+                );
+            }
+            None => {
+                assert!(it.finished);
+                kani::cover(finished, "next_back: already finished");
+                kani::cover(
+                    !finished && !trailing,
+                    "next_back: only an empty trailing fragment remained",
+                );
+            }
         }
-        if let Some(part) = it.next_back() {
-            assert!(part.len() <= s.len());
-        }
+        assert!(split_invariant(&it));
+        assert!(it.start == f.start);
+        assert!(it.end <= f.end);
+        assert!(cs_finger(&it.matcher) == f.finger);
+        assert!(cs_needle(&it.matcher) == f.needle);
+        assert!(same_str(it.matcher.haystack(), s));
     }
 
-    /// `SplitInternal::next_back` via `split_terminator` (exercises the
-    /// allow_trailing_empty=false path).
+    /// `SplitInternal::next_back_inclusive` from an arbitrary `C`-state:
+    /// as `next_back`, but `end` becomes the match end `b` (so
+    /// `finger_back < end` afterwards, which `C` allows).
     #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memrchr, stub_memrchr)]
-    pub fn check_split_terminator_next_back() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.split_terminator(p);
-        if let Some(part) = it.next_back() {
-            assert!(part.len() <= s.len());
+    #[kani::stub_verified(crate::str::pattern::CharSearcher::next_match_back)]
+    pub fn check_split_next_back_inclusive() {
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it = any_split(s);
+        let f = split_frame(&it);
+        let finished = it.finished;
+        let trailing = it.allow_trailing_empty;
+        match it.next_back_inclusive() {
+            Some(part) => {
+                assert!(!finished);
+                let lo = offset_in(s, part);
+                let hi = lo + part.len();
+                assert!(f.start <= lo && hi <= f.end);
+                assert!(s.is_char_boundary(lo) && s.is_char_boundary(hi));
+                if it.finished {
+                    assert!(lo == f.start);
+                    kani::cover(true, "next_back_inclusive: final fragment");
+                } else {
+                    assert!(it.end == lo);
+                    assert!(cs_finger_back(&it.matcher) + f.needle.len_utf8() == lo);
+                    kani::cover(part.is_empty(), "next_back_inclusive: empty fragment");
+                    kani::cover(!part.is_empty(), "next_back_inclusive: nonempty fragment");
+                }
+                kani::cover(
+                    !trailing && !part.is_empty(),
+                    "next_back_inclusive: fragment returned with allow_trailing_empty == false",
+                );
+            }
+            None => {
+                assert!(it.finished);
+                kani::cover(finished, "next_back_inclusive: already finished");
+                kani::cover(
+                    !finished && !trailing,
+                    "next_back_inclusive: only an empty trailing fragment remained",
+                );
+            }
         }
+        assert!(split_invariant(&it));
+        assert!(it.start == f.start);
+        assert!(it.end <= f.end);
+        assert!(cs_finger(&it.matcher) == f.finger);
+        assert!(cs_needle(&it.matcher) == f.needle);
+        assert!(same_str(it.matcher.haystack(), s));
     }
 
-    /// `SplitInternal::next_back_inclusive` via `split_inclusive`.
+    /// `SplitInternal::get_end` from an arbitrary `C`-state, called
+    /// directly: on an unfinished iterator it finishes it and returns
+    /// `start..end` iff a trailing empty fragment is allowed or the range
+    /// is nonempty; on a finished one it is a no-op returning `None`.
     #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memrchr, stub_memrchr)]
-    pub fn check_split_inclusive_next_back() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.split_inclusive(p);
-        if let Some(part) = it.next_back() {
-            assert!(part.len() <= s.len());
+    pub fn check_split_get_end() {
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it = any_split(s);
+        let f = split_frame(&it);
+        let finished = it.finished;
+        let trailing = it.allow_trailing_empty;
+        let res = it.get_end();
+        assert!(it.finished);
+        match res {
+            Some(part) => {
+                assert!(!finished);
+                assert!(trailing || f.end > f.start);
+                assert_is_range(s, part, f.start, f.end);
+                kani::cover(
+                    trailing && part.is_empty(),
+                    "get_end: empty trailing fragment allowed",
+                );
+                kani::cover(
+                    !trailing && !part.is_empty(),
+                    "get_end: nonempty fragment, trailing empty disallowed",
+                );
+            }
+            None => {
+                assert!(finished || (!trailing && f.end == f.start));
+                kani::cover(finished, "get_end: already finished");
+                kani::cover(!finished, "get_end: empty trailing fragment suppressed");
+            }
         }
+        assert!(split_invariant(&it));
+        assert!(it.start == f.start && it.end == f.end);
+        assert!(cs_finger(&it.matcher) == f.finger && cs_finger_back(&it.matcher) == f.finger_back);
     }
 
-    /// `SplitInternal::remainder` before and after consuming a fragment.
+    /// `SplitInternal::remainder` from an arbitrary `C`-state: `None` iff
+    /// finished, else `start..end`; the state is untouched.
     #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memchr, stub_memchr)]
     pub fn check_split_remainder() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.split(p);
-        assert_eq!(it.remainder(), Some(s));
-        let _ = it.next();
-        if let Some(rem) = it.remainder() {
-            assert!(rem.len() <= s.len());
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let it = any_split(s);
+        let f = split_frame(&it);
+        match it.remainder() {
+            Some(rem) => {
+                assert!(!it.finished);
+                assert_is_range(s, rem, f.start, f.end);
+                kani::cover(rem.is_empty(), "remainder: empty");
+                kani::cover(!rem.is_empty(), "remainder: nonempty");
+            }
+            None => {
+                assert!(it.finished);
+                kani::cover(true, "remainder: finished");
+            }
         }
+        assert!(split_invariant(&it));
+        assert!(it.start == f.start && it.end == f.end);
     }
 
-    /// `MatchesInternal::next` / `next_back` via `matches`/`rmatches`
-    /// paths (real searcher both directions).
-    #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memchr, stub_memchr)]
-    pub fn check_matches_next() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.matches(p);
-        if let Some(m) = it.next() {
-            assert_eq!(m.len(), p.len_utf8());
-            kani::cover(true, "a match was found");
-        }
-    }
+    // ------------------------------------------------------------------
+    // MatchIndicesInternal / MatchesInternal
+    //
+    // Type invariant: the wrapped searcher satisfies its own invariant
+    // (nothing else is stored). Arbitrary `C`-states are produced by
+    // `any_char_searcher`.
+    // ------------------------------------------------------------------
 
+    /// `MatchIndicesInternal::next`: the returned index is the match
+    /// start, a char boundary, and the slice is the match.
     #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memrchr, stub_memrchr)]
-    pub fn check_matches_next_back() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.matches(p);
-        if let Some(m) = it.next_back() {
-            assert_eq!(m.len(), p.len_utf8());
-        }
-    }
-
-    /// `MatchIndicesInternal::next` / `next_back`: the returned index is
-    /// a char boundary and the slice at it equals the match.
-    #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memchr, stub_memchr)]
+    #[kani::stub_verified(crate::str::pattern::CharSearcher::next_match)]
     pub fn check_match_indices_next() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.match_indices(p);
-        if let Some((i, m)) = it.next() {
-            assert!(s.is_char_boundary(i));
-            assert!(i + m.len() <= s.len());
-            // `get` instead of indexing: the indexing panic path drags
-            // slice_error_fail formatting into the formula and overflows
-            // CBMC's object limit.
-            assert!(s.get(i..i + m.len()) == Some(m));
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it: MatchIndicesInternal<'_, char> = MatchIndicesInternal(any_char_searcher(s));
+        let (finger, finger_back, needle) =
+            (cs_finger(&it.0), cs_finger_back(&it.0), cs_needle(&it.0));
+        match it.next() {
+            Some((i, m)) => {
+                assert!(finger <= i);
+                assert_is_range(s, m, i, i + needle.len_utf8());
+                assert!(i + m.len() <= finger_back);
+                assert!(cs_finger(&it.0) == i + m.len());
+                kani::cover(m.len() > 1, "match_indices next: multibyte match");
+                kani::cover(i > 0, "match_indices next: match after the start");
+            }
+            None => {
+                assert!(cs_finger(&it.0) == finger_back);
+                kani::cover(true, "match_indices next: no match");
+            }
         }
+        assert!(type_invariant_cs(&it.0));
+        assert!(cs_finger_back(&it.0) == finger_back && cs_needle(&it.0) == needle);
+        assert!(same_str(it.0.haystack(), s));
     }
 
+    /// `MatchIndicesInternal::next_back`: as `next`, searching backwards.
     #[kani::proof]
-    #[kani::unwind(8)]
-    #[kani::stub(crate::slice::memchr::memrchr, stub_memrchr)]
+    #[kani::stub_verified(crate::str::pattern::CharSearcher::next_match_back)]
     pub fn check_match_indices_next_back() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let p: char = kani::any();
-        let mut it = s.match_indices(p);
-        if let Some((i, m)) = it.next_back() {
-            assert!(s.is_char_boundary(i));
-            assert!(i + m.len() <= s.len());
-            assert!(s.get(i..i + m.len()) == Some(m));
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it: MatchIndicesInternal<'_, char> = MatchIndicesInternal(any_char_searcher(s));
+        let (finger, finger_back, needle) =
+            (cs_finger(&it.0), cs_finger_back(&it.0), cs_needle(&it.0));
+        match it.next_back() {
+            Some((i, m)) => {
+                assert!(finger <= i);
+                assert_is_range(s, m, i, i + needle.len_utf8());
+                assert!(i + m.len() <= finger_back);
+                assert!(cs_finger_back(&it.0) == i);
+                kani::cover(m.len() > 1, "match_indices next_back: multibyte match");
+                kani::cover(
+                    i + m.len() < finger_back,
+                    "match_indices next_back: match before the end",
+                );
+            }
+            None => {
+                assert!(cs_finger_back(&it.0) == finger);
+                kani::cover(true, "match_indices next_back: no match");
+            }
         }
+        assert!(type_invariant_cs(&it.0));
+        assert!(cs_finger(&it.0) == finger && cs_needle(&it.0) == needle);
+        assert!(same_str(it.0.haystack(), s));
     }
 
-    /// `SplitAsciiWhitespace::remainder`.
+    /// `MatchesInternal::next`: the returned slice is the match.
     #[kani::proof]
-    #[kani::unwind(8)]
-    pub fn check_split_ascii_whitespace_remainder() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let mut it = s.split_ascii_whitespace();
-        if let Some(rem) = it.remainder() {
-            assert!(rem.len() <= s.len());
+    #[kani::stub_verified(crate::str::pattern::CharSearcher::next_match)]
+    pub fn check_matches_next() {
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it: MatchesInternal<'_, char> = MatchesInternal(any_char_searcher(s));
+        let (finger, finger_back, needle) =
+            (cs_finger(&it.0), cs_finger_back(&it.0), cs_needle(&it.0));
+        match it.next() {
+            Some(m) => {
+                let i = offset_in(s, m);
+                assert!(finger <= i);
+                assert_is_range(s, m, i, i + needle.len_utf8());
+                assert!(i + m.len() <= finger_back);
+                assert!(cs_finger(&it.0) == i + m.len());
+                kani::cover(m.len() > 1, "matches next: multibyte match");
+            }
+            None => {
+                assert!(cs_finger(&it.0) == finger_back);
+                kani::cover(true, "matches next: no match");
+            }
         }
-        let _ = it.next();
-        if let Some(rem) = it.remainder() {
-            assert!(rem.len() <= s.len());
+        assert!(type_invariant_cs(&it.0));
+        assert!(cs_finger_back(&it.0) == finger_back && cs_needle(&it.0) == needle);
+        assert!(same_str(it.0.haystack(), s));
+    }
+
+    /// `MatchesInternal::next_back`: as `next`, searching backwards.
+    #[kani::proof]
+    #[kani::stub_verified(crate::str::pattern::CharSearcher::next_match_back)]
+    pub fn check_matches_next_back() {
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it: MatchesInternal<'_, char> = MatchesInternal(any_char_searcher(s));
+        let (finger, finger_back, needle) =
+            (cs_finger(&it.0), cs_finger_back(&it.0), cs_needle(&it.0));
+        match it.next_back() {
+            Some(m) => {
+                let i = offset_in(s, m);
+                assert!(finger <= i);
+                assert_is_range(s, m, i, i + needle.len_utf8());
+                assert!(i + m.len() <= finger_back);
+                assert!(cs_finger_back(&it.0) == i);
+                kani::cover(m.len() > 1, "matches next_back: multibyte match");
+            }
+            None => {
+                assert!(cs_finger_back(&it.0) == finger);
+                kani::cover(true, "matches next_back: no match");
+            }
+        }
+        assert!(type_invariant_cs(&it.0));
+        assert!(cs_finger(&it.0) == finger && cs_needle(&it.0) == needle);
+        assert!(same_str(it.0.haystack(), s));
+    }
+
+    // ------------------------------------------------------------------
+    // SplitAsciiWhitespace
+    //
+    // Type invariant: the inner `slice::Split`'s unconsumed slice `v` is a
+    // char-boundary window of the string. `split_ascii_whitespace`
+    // starts with the whole string; each `next` (`next_back`) cuts `v`
+    // after (before) an ASCII-whitespace byte, which is a one-byte
+    // character, so every reachable `v` is such a window, and every
+    // window is one `C`-state.
+    // ------------------------------------------------------------------
+
+    /// `SplitAsciiWhitespace::remainder` (`from_utf8_unchecked` over `v`)
+    /// on the fresh iterator and on an arbitrary `C`-state.
+    #[kani::proof]
+    pub fn check_split_ascii_whitespace_remainder() {
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let mut it = s.split_ascii_whitespace();
+        assert!(it.remainder().is_some_and(|rem| same_str(rem, s)));
+        let (k, m) = any_window(s);
+        it.inner.iter.iter.v = window(s, k, m).as_bytes();
+        it.inner.iter.iter.finished = kani::any();
+        match it.remainder() {
+            Some(rem) => {
+                assert!(!it.inner.iter.iter.finished);
+                assert_is_range(s, rem, k, m);
+                kani::cover(!rem.is_empty(), "split_ascii_whitespace remainder: nonempty");
+            }
+            None => {
+                assert!(it.inner.iter.iter.finished);
+                kani::cover(true, "split_ascii_whitespace remainder: finished");
+            }
         }
     }
 
-    /// Contract harness for `Bytes::__iterator_get_unchecked`: verifies
-    /// the pre-existing `#[requires(idx < self.0.len())]` is sufficient
-    /// to rule out UB in the body. Under CI's `--no-assert-contracts` a
-    /// contract is only checked by a `proof_for_contract` harness.
+    // ------------------------------------------------------------------
+    // Bytes
+    // ------------------------------------------------------------------
+
+    /// Contract harness for `Bytes::__iterator_get_unchecked`: its
+    /// `#[requires(idx < self.0.len())]` rules out UB in the body, for a
+    /// `Bytes` over any window of a string of arbitrary length. Under
+    /// CI's `--no-assert-contracts` a contract is only checked by a
+    /// `proof_for_contract` harness.
     #[kani::proof_for_contract(Bytes::__iterator_get_unchecked)]
-    #[kani::unwind(8)]
     pub fn check_bytes_iterator_get_unchecked() {
-        let mut buf = [0u8; HAYSTACK_BYTES];
-        let s = symbolic_str(&mut buf);
-        let mut bytes = s.bytes();
+        let arr: [u8; HAY_ARR] = kani::any();
+        let s = any_haystack(&arr);
+        let (k, m) = any_window(s);
+        let w = window(s, k, m);
+        let mut bytes = w.bytes();
         let idx: usize = kani::any();
         let b = unsafe { bytes.__iterator_get_unchecked(idx) };
-        assert_eq!(b, s.as_bytes()[idx]);
+        assert!(b == w.as_bytes()[idx]);
+        kani::cover(idx > 0, "bytes get_unchecked: index past the start");
     }
 }
