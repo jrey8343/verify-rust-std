@@ -2275,7 +2275,13 @@ pub mod verify {
             && s.haystack.is_char_boundary(s.finger)
             && s.haystack.is_char_boundary(s.finger_back)
             && s.utf8_size() == enc_len
-            && s.utf8_encoded[..enc_len] == enc[..enc_len]
+            // byte-wise rather than `==` on the slices, which lowers to
+            // CBMC's `memcmp` loop and would force an unwind bound on
+            // every harness that states `C` (`enc_len >= 1` always)
+            && s.utf8_encoded[0] == enc[0]
+            && (enc_len < 2 || s.utf8_encoded[1] == enc[1])
+            && (enc_len < 3 || s.utf8_encoded[2] == enc[2])
+            && (enc_len < 4 || s.utf8_encoded[3] == enc[3])
     }
 
     /// An arbitrary `CharSearcher` state satisfying `C` — the induction
