@@ -1693,8 +1693,9 @@ pub mod verify {
     /// Maximum haystack length in bytes: the size of the symbolic backing
     /// allocation, not a loop bound (see the module comment). Haystack
     /// lengths range over `0..=HAY_MAX`; 256 keeps every harness within
-    /// a few minutes under CI's flags (at 1000 they take ~10 minutes
-    /// each and `check_chars_advance_by` over an hour).
+    /// a few minutes under CI's flags (at 1000 the loop-free harnesses
+    /// take about 2 minutes each run alone, ~11x the time at 256, and
+    /// `check_chars_advance_by` did not finish within an hour).
     // TODO: HAY_MAX can be much larger with cbmc argument `--arrays-uf-always`
     const HAY_MAX: usize = 256;
     /// Size of the backing array behind a `HAY_MAX`-byte haystack.
@@ -1828,9 +1829,10 @@ pub mod verify {
     const ADVANCE_MAX: usize = 8;
     /// Backing-array size of `check_chars_advance_by`. Its per-character
     /// loop is unwound, so unlike the loop-free harnesses its memory use
-    /// grows with the array (4.8 GB at HAY_MAX, 1.1 GB at 96); 128 keeps
-    /// it inside the budget of CI's macOS runners. Like HAY_MAX it is the
-    /// size of the symbolic backing allocation, not a loop bound.
+    /// grows with the array (measured peak RSS: 4.8 GB at HAY_MAX, 1.8 GB
+    /// at 128); 128 keeps it inside the budget of CI's macOS runners.
+    /// Like HAY_MAX it is the size of the symbolic backing allocation,
+    /// not a loop bound.
     const ADVANCE_HAY_MAX: usize = 128;
     const ADVANCE_ARR: usize = ADVANCE_HAY_MAX + PAD;
     /// Advance-count range of `check_chars_advance_by_chunked`, the
@@ -1849,7 +1851,7 @@ pub mod verify {
     /// a whole chunk at a symbolic offset and runs two 32-iteration
     /// loops, and with a symbolic string length -- or a symbolic start of
     /// a fixed-length window -- the 33 copies the unwind bound implies
-    /// exceed 11 GB. So the chunk-skip path is verified for every
+    /// exceed 11 GB of RSS (measured). So the chunk-skip path is verified for every
     /// 48-byte string; the per-character path (`check_chars_advance_by`)
     /// for arbitrary windows of strings of arbitrary length.
     const CHUNKED_WINDOW: usize = 48;
