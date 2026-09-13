@@ -538,7 +538,7 @@ unsafe impl<'a> ReverseSearcher<'a> for CharSearcher<'a> {
     #[ensures(|result| match *result {
         Some((a, b)) => a == self.finger_back
             && a < b
-            && b == a + self.utf8_size()
+            && b - a == self.utf8_size()
             && b <= old(self.finger_back)
             && self.finger <= a
             && self.haystack.is_char_boundary(a)
