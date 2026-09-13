@@ -2746,8 +2746,8 @@ pub mod verify {
     const MATCH_NDL_MAX: usize = 6;
     /// Extra bytes past the maximum length so the byte-table predicates
     /// may read up to four bytes after any index `< MAX` without leaving
-    /// the backing array.
-    const PAD: usize = 4;
+    /// the backing array. Shared with `str::iter::verify` (Challenge 22).
+    pub const PAD: usize = 4;
     const _: () =
         assert!(NEW_NDL_MAX <= NDL_QMAX && NDL_MAX <= NDL_QMAX && MATCH_NDL_MAX <= NDL_QMAX);
 
@@ -2785,7 +2785,7 @@ pub mod verify {
     /// or statement expressions inside it are rejected or blow up
     /// instrumentation. Every read stays inside the backing array because
     /// of `PAD`.
-    fn utf8_local<const N: usize>(arr: &[u8; N], len: usize) -> bool {
+    pub fn utf8_local<const N: usize>(arr: &[u8; N], len: usize) -> bool {
         let p = arr.as_ptr();
         let lead = crate::forall!(|i in (0, N - PAD)| unsafe {
             let i: usize = i;
@@ -2828,8 +2828,9 @@ pub mod verify {
     }
 
     /// An arbitrary valid UTF-8 string of symbolic length `0..=N - PAD`
-    /// backed by a caller-owned array of arbitrary content.
-    fn any_utf8<const N: usize>(arr: &[u8; N]) -> &str {
+    /// backed by a caller-owned array of arbitrary content. Shared with
+    /// `str::iter::verify` (Challenge 22).
+    pub fn any_utf8<const N: usize>(arr: &[u8; N]) -> &str {
         let len: usize = kani::any();
         kani::assume(len <= N - PAD);
         kani::assume(utf8_local(arr, len));
