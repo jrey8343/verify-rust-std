@@ -5876,6 +5876,27 @@ mod verify {
     // unallocated memory" and "memset destination region writeable" (all in the harness's
     // generator `any_deque`, before `buffer_read` is called).
     repro_contract_harness!(repro_contract_static_write, ReproStaticWrite);
+    /// A static written by this destructor only and read nowhere.
+    pub(super) static mut REPRO_FRESH: usize = 0;
+    #[derive(kani::Arbitrary)]
+    pub(super) struct ReproFreshStaticWrite(u8);
+    impl Drop for ReproFreshStaticWrite {
+        fn drop(&mut self) {
+            unsafe { REPRO_FRESH += 1 };
+            core::hint::black_box(self.0);
+        }
+    }
+    impl Shape for ReproFreshStaticWrite {}
+    repro_contract_harness!(repro_contract_fresh_static_write, ReproFreshStaticWrite);
+    #[kani::proof_for_contract(VecDeque::<ReproFreshStaticWrite>::buffer_read)]
+    fn repro_contract_fresh_static_write_small_cap() {
+        let mut deque = any_deque::<ReproFreshStaticWrite>();
+        kani::assume(deque.capacity() <= 4);
+        let off: usize = kani::any();
+        let value = unsafe { deque.buffer_read(wi(off)) };
+        core::mem::forget(value);
+        finish(deque);
+    }
     // Verifies.
     repro_contract_harness!(repro_contract_read_only, ReproReadOnly);
     // Same type, plain proof instead of a contract harness: verifies.
