@@ -5833,6 +5833,71 @@ mod verify {
     /// unwind bound, which is fine there: only the drop glue is bounded); the `write_iter`
     /// iteration is exercised through the contract-free `write_iter_for_each`, the shipped
     /// statement.
+    // ---------------------------------------------------------------------------------------
+    // Reproducer for the Kani issue "destructor writing a static breaks proof_for_contract
+    // harnesses with symbolic-size allocations" (not for merge).
+    // ---------------------------------------------------------------------------------------
+
+    /// Same as `WithDrop` but its destructor also increments a static.
+    #[derive(kani::Arbitrary)]
+    pub(super) struct ReproStaticWrite(u8);
+    impl Drop for ReproStaticWrite {
+        fn drop(&mut self) {
+            unsafe { DROPS += 1 };
+            core::hint::black_box(self.0);
+        }
+    }
+    impl Shape for ReproStaticWrite {}
+
+    /// Control: destructor reads only.
+    #[derive(kani::Arbitrary)]
+    pub(super) struct ReproReadOnly(u8);
+    impl Drop for ReproReadOnly {
+        fn drop(&mut self) {
+            core::hint::black_box(self.0);
+        }
+    }
+    impl Shape for ReproReadOnly {}
+
+    macro_rules! repro_contract_harness {
+        ($name:ident, $t:ty) => {
+            #[kani::proof_for_contract(VecDeque::<$t>::buffer_read)]
+            fn $name() {
+                let mut deque = any_deque::<$t>();
+                let off: usize = kani::any();
+                let value = unsafe { deque.buffer_read(wi(off)) };
+                core::mem::forget(value);
+                finish(deque);
+            }
+        };
+    }
+    // Fails with "Offset result address must equal original pointer address plus offset",
+    // "Offset value overflows isize", "Kani does not support reasoning about pointer to
+    // unallocated memory" and "memset destination region writeable" (all in the harness's
+    // generator `any_deque`, before `buffer_read` is called).
+    repro_contract_harness!(repro_contract_static_write, ReproStaticWrite);
+    // Verifies.
+    repro_contract_harness!(repro_contract_read_only, ReproReadOnly);
+    // Same type, plain proof instead of a contract harness: verifies.
+    #[kani::proof]
+    fn repro_plain_static_write() {
+        let mut deque = any_deque::<ReproStaticWrite>();
+        kani::assume(deque.len() > 0);
+        let head = deque.head;
+        core::mem::forget(unsafe { deque.buffer_read(head) });
+        finish(deque);
+    }
+    // Same contract harness with the capacity bounded: verifies.
+    #[kani::proof_for_contract(VecDeque::<ReproStaticWrite>::buffer_read)]
+    fn repro_contract_static_write_small_cap() {
+        let mut deque = any_deque::<ReproStaticWrite>();
+        kani::assume(deque.capacity() <= 4);
+        let off: usize = kani::any();
+        let value = unsafe { deque.buffer_read(wi(off)) };
+        core::mem::forget(value);
+        finish(deque);
+    }
+
     mod bounded_evidence {
         use core::iter::ByRefSized;
 
